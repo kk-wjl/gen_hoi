@@ -206,7 +206,6 @@ class MotionLoader(Dataset):
         self.raw_keys = tuple(raw_list[0].keys())
         self.fps = float(np.asarray(raw_list[0]["fps"]).reshape(-1)[0])
         self.dt = 1.0 / self.fps
-        self.source_files = [str(path) for path in self.npz_paths]
         self.joint_pos = torch.cat(
             [torch.as_tensor(raw["joint_pos"], dtype=dtype) for raw in raw_list],
             dim=0,

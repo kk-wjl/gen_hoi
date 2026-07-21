@@ -1,12 +1,8 @@
-from __future__ import annotations
-
-import argparse
-import dataclasses
 import json
 import random
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from cfg import Config, parse_args
 from dataset import MotionLoader
 from flow import LinearFlow
 from model import DiffusionTransformer1D
@@ -27,186 +24,7 @@ from utils.checkpoint import load_training_checkpoint, save_training_checkpoint
 from utils.optim import MuonAdamWWrapper
 
 
-@dataclass
-class DatasetConfig:
-    npz_path: str = "data"
-    seq_len: int = 32
-    stride: int = 1
-    make_relative: bool = True
-    normalize: bool = True
-    use_stats_cache: bool = True
-
-
-@dataclass
-class ModelConfig:
-    hidden_size: int = 256
-    depth: int = 8
-    num_heads: int = 8
-    mlp_ratio: float = 4.0
-    dropout: float = 0.0
-    max_seq_len: int = 256
-
-
-@dataclass
-class OptimConfig:
-    name: str = "adamw"
-    lr: float = 1e-4
-    weight_decay: float = 1e-2
-    grad_clip_norm: float = 1.0
-
-
-@dataclass
-class FlowConfig:
-    noise_scale: float = 1.0
-    t_eps: float = 1e-5
-
-
-@dataclass
-class TrainConfig:
-    batch_size: int = 64
-    epochs: int = 100
-    num_workers: int = 0
-    seed: int = 42
-    device: str = "auto"
-    log_every: int = 10
-    save_every: int = 5
-    sample_every: int = 5
-    cond_steps: int = 8
-    sample_steps: int = 50
-
-
-@dataclass
-class OutputConfig:
-    root_dir: str = "outputs"
-    run_name: str = ""
-
-
-@dataclass
-class WandbConfig:
-    enabled: bool = False
-    project: str = "gen-hoi"
-    entity: str | None = None
-    name: str = ""
-    mode: str = "online"
-
-
-@dataclass
-class Config:
-    dataset: DatasetConfig = dataclasses.field(default_factory=DatasetConfig)
-    model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
-    flow: FlowConfig = dataclasses.field(default_factory=FlowConfig)
-    train: TrainConfig = dataclasses.field(default_factory=TrainConfig)
-    output: OutputConfig = dataclasses.field(default_factory=OutputConfig)
-    wandb: WandbConfig = dataclasses.field(default_factory=WandbConfig)
-    resume: str | None = None
-
-
-def parse_args() -> Config:
-    parser = argparse.ArgumentParser(description="Train the HOI diffusion transformer.")
-    parser.add_argument("--data", default=DatasetConfig.npz_path)
-    parser.add_argument("--output-root", default=OutputConfig.root_dir)
-    parser.add_argument("--run-name", default="")
-    parser.add_argument("--resume", default=None)
-
-    parser.add_argument("--seq-len", type=int, default=DatasetConfig.seq_len)
-    parser.add_argument("--stride", type=int, default=DatasetConfig.stride)
-    parser.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
-    parser.add_argument("--epochs", type=int, default=TrainConfig.epochs)
-    parser.add_argument("--num-workers", type=int, default=TrainConfig.num_workers)
-    parser.add_argument("--seed", type=int, default=TrainConfig.seed)
-    parser.add_argument("--device", default=TrainConfig.device)
-
-    parser.add_argument("--hidden-size", type=int, default=ModelConfig.hidden_size)
-    parser.add_argument("--depth", type=int, default=ModelConfig.depth)
-    parser.add_argument("--num-heads", type=int, default=ModelConfig.num_heads)
-    parser.add_argument("--mlp-ratio", type=float, default=ModelConfig.mlp_ratio)
-    parser.add_argument("--dropout", type=float, default=ModelConfig.dropout)
-    parser.add_argument("--max-seq-len", type=int, default=ModelConfig.max_seq_len)
-
-    parser.add_argument("--optimizer", choices=["adamw", "muon_adamw"], default=OptimConfig.name)
-    parser.add_argument("--lr", type=float, default=OptimConfig.lr)
-    parser.add_argument("--weight-decay", type=float, default=OptimConfig.weight_decay)
-    parser.add_argument("--grad-clip-norm", type=float, default=OptimConfig.grad_clip_norm)
-
-    parser.add_argument("--noise-scale", type=float, default=FlowConfig.noise_scale)
-    parser.add_argument("--t-eps", type=float, default=FlowConfig.t_eps)
-
-    parser.add_argument("--log-every", type=int, default=TrainConfig.log_every)
-    parser.add_argument("--save-every", type=int, default=TrainConfig.save_every)
-    parser.add_argument("--sample-every", type=int, default=TrainConfig.sample_every)
-    parser.add_argument("--cond-steps", type=int, default=TrainConfig.cond_steps)
-    parser.add_argument("--sample-steps", type=int, default=TrainConfig.sample_steps)
-
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
-    parser.add_argument("--wandb-project", default=WandbConfig.project)
-    parser.add_argument("--wandb-entity", default=WandbConfig.entity)
-    parser.add_argument("--wandb-name", default="")
-    parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=WandbConfig.mode)
-    args = parser.parse_args()
-
-    return Config(
-        dataset=DatasetConfig(
-            npz_path=args.data,
-            seq_len=args.seq_len,
-            stride=args.stride,
-        ),
-        model=ModelConfig(
-            hidden_size=args.hidden_size,
-            depth=args.depth,
-            num_heads=args.num_heads,
-            mlp_ratio=args.mlp_ratio,
-            dropout=args.dropout,
-            max_seq_len=args.max_seq_len,
-        ),
-        optim=OptimConfig(
-            name=args.optimizer,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            grad_clip_norm=args.grad_clip_norm,
-        ),
-        flow=FlowConfig(
-            noise_scale=args.noise_scale,
-            t_eps=args.t_eps,
-        ),
-        train=TrainConfig(
-            batch_size=args.batch_size,
-            epochs=args.epochs,
-            num_workers=args.num_workers,
-            seed=args.seed,
-            device=args.device,
-            log_every=args.log_every,
-            save_every=args.save_every,
-            sample_every=args.sample_every,
-            cond_steps=args.cond_steps,
-            sample_steps=args.sample_steps,
-        ),
-        output=OutputConfig(
-            root_dir=args.output_root,
-            run_name=args.run_name,
-        ),
-        wandb=WandbConfig(
-            enabled=args.wandb,
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=args.wandb_name,
-            mode=args.wandb_mode,
-        ),
-        resume=args.resume,
-    )
-
-
-def resolve_device(device_arg: str) -> torch.device:
-    if device_arg != "auto":
-        return torch.device(device_arg)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def seed_everything(seed: int) -> None:
+def seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -236,17 +54,6 @@ def resolve_data_paths(npz_path: str) -> list[Path]:
     if path.is_file() and path.suffix == ".npz":
         return [path]
     raise ValueError(f"--data must point to a .npz file or a directory of .npz files, got {path}")
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
-
-
-def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
 def setup_wandb(config: Config, run_dir: Path, payload: dict[str, Any]) -> Any | None:
@@ -326,13 +133,8 @@ def save_sample(
 
 def main() -> None:
     config = parse_args()
-    if config.train.cond_steps >= config.dataset.seq_len:
-        raise ValueError("cond_steps must be smaller than seq_len")
-    if config.model.max_seq_len < config.dataset.seq_len:
-        raise ValueError("max_seq_len must be >= seq_len")
-
-    seed_everything(config.train.seed)
-    device = resolve_device(config.train.device)
+    seed(config.train.seed)
+    device = torch.device(config.train.device)
     run_dir = build_run_dir(config)
     checkpoint_dir = run_dir / "checkpoints"
     log_path = run_dir / "logs" / "train_metrics.jsonl"
@@ -387,13 +189,22 @@ def main() -> None:
         "num_windows": len(dataset),
         "run_dir": str(run_dir.resolve()),
     }
-    write_json(run_dir / "config.json", run_config)
-    write_json(
-        run_dir / "dataset_stats.json",
-        {
-            "mean": dataset.state_mean.cpu().tolist(),
-            "std": dataset.state_std.cpu().tolist(),
-        },
+    config_path = run_dir / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(run_config, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    dataset_stats_path = run_dir / "dataset_stats.json"
+    dataset_stats_path.parent.mkdir(parents=True, exist_ok=True)
+    dataset_stats_path.write_text(
+        json.dumps(
+            {
+                "mean": dataset.state_mean.cpu().tolist(),
+                "std": dataset.state_std.cpu().tolist(),
+            },
+            ensure_ascii=True,
+            indent=2,
+        ),
+        encoding="utf-8",
     )
     wandb_run = setup_wandb(config, run_dir, run_config)
 
@@ -466,7 +277,9 @@ def main() -> None:
         if epoch_loss < best_loss:
             best_loss = epoch_loss
 
-        append_jsonl(log_path, metrics)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(metrics, ensure_ascii=True) + "\n")
         print(json.dumps(metrics, ensure_ascii=True))
         if wandb_run is not None:
             wandb_run.log(metrics, step=epoch + 1)
