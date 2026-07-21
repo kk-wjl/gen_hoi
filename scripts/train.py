@@ -44,18 +44,6 @@ def build_run_dir(config: Config) -> Path:
     return root_dir / run_name
 
 
-def resolve_data_paths(npz_path: str) -> list[Path]:
-    path = Path(npz_path).expanduser().resolve()
-    if path.is_dir():
-        npz_paths = sorted(path.glob("*.npz"))
-        if not npz_paths:
-            raise ValueError(f"No .npz files found under directory {path}")
-        return npz_paths
-    if path.is_file() and path.suffix == ".npz":
-        return [path]
-    raise ValueError(f"--data must point to a .npz file or a directory of .npz files, got {path}")
-
-
 def setup_wandb(config: Config, run_dir: Path, payload: dict[str, Any]) -> Any | None:
     if not config.wandb.enabled:
         return None
@@ -138,10 +126,9 @@ def main() -> None:
     run_dir = build_run_dir(config)
     checkpoint_dir = run_dir / "checkpoints"
     log_path = run_dir / "logs" / "train_metrics.jsonl"
-    data_paths = resolve_data_paths(config.dataset.npz_path)
 
     dataset = MotionLoader(
-        npz_path=data_paths,
+        npz_path=config.dataset.npz_path,
         seq_len=config.dataset.seq_len,
         stride=config.dataset.stride,
         make_relative=config.dataset.make_relative,
@@ -182,7 +169,7 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     run_config = {
         **asdict(config),
-        "data_files": [str(path) for path in data_paths],
+        "data_files": [str(path) for path in dataset.npz_paths],
         "resolved_device": str(device),
         "feature_dim": dataset.feature_dim,
         "num_frames": dataset.num_frames,

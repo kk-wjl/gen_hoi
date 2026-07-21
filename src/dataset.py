@@ -75,9 +75,17 @@ def _normalize_npz_paths(npz_path: str | Path | list[str | Path] | tuple[str | P
         paths = [Path(npz_path)]
     else:
         paths = [Path(path) for path in npz_path]
-    resolved = [path.expanduser().resolve() for path in paths]
+    resolved: list[Path] = []
+    for path in paths:
+        resolved_path = path.expanduser().resolve()
+        if resolved_path.is_dir():
+            resolved.extend(sorted(resolved_path.glob("*.npz")))
+        else:
+            resolved.append(resolved_path)
     if not resolved:
         raise ValueError("npz_path must contain at least one .npz file")
+    if not all(path.is_file() and path.suffix == ".npz" for path in resolved):
+        raise ValueError("npz_path must point to .npz files or directories containing .npz files")
     return resolved
 
 
