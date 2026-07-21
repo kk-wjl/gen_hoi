@@ -70,18 +70,36 @@ FEATURE_DIM = OBJECT_VEL_END
 MOTION_STATS_CACHE_VERSION = 1
 
 
+def _normalize_npz_paths(npz_path: str | Path | list[str | Path] | tuple[str | Path, ...]) -> list[Path]:
+    if isinstance(npz_path, (str, Path)):
+        paths = [Path(npz_path)]
+    else:
+        paths = [Path(path) for path in npz_path]
+    resolved = [path.expanduser().resolve() for path in paths]
+    if not resolved:
+        raise ValueError("npz_path must contain at least one .npz file")
+    return resolved
+
+
 def _motion_stats_fingerprint(
-    npz_path: Path,
+    npz_paths: list[Path],
     seq_len: int,
     stride: int,
     make_relative: bool,
 ) -> tuple[str, dict[str, Any]]:
-    stat = npz_path.stat()
+    files: list[dict[str, Any]] = []
+    for npz_path in npz_paths:
+        stat = npz_path.stat()
+        files.append(
+            {
+                "name": npz_path.name,
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
     payload: dict[str, Any] = {
         "cache_version": MOTION_STATS_CACHE_VERSION,
-        "npz_name": npz_path.name,
-        "npz_size": stat.st_size,
-        "npz_mtime_ns": stat.st_mtime_ns,
+        "files": files,
         "seq_len": seq_len,
         "stride": stride,
         "make_relative": make_relative,
@@ -161,7 +179,7 @@ class MotionLoader(Dataset):
 
     def __init__(
         self,
-        npz_path: str | Path,
+        npz_path: str | Path | list[str | Path] | tuple[str | Path, ...],
         seq_len: int = 32,
         stride: int = 1,
         *,
@@ -176,7 +194,7 @@ class MotionLoader(Dataset):
         if stride < 1:
             raise ValueError("stride must be >= 1")
 
-        self.npz_path = Path(npz_path).expanduser().resolve()
+        self.npz_paths = _normalize_npz_paths(npz_path)
         self.seq_len = seq_len
         self.stride = stride
         self.make_relative_enabled = make_relative
@@ -184,23 +202,51 @@ class MotionLoader(Dataset):
         self.use_stats_cache = use_stats_cache
         self.dtype = dtype
 
-        raw = np.load(self.npz_path, allow_pickle=True)
-        self.raw_keys = tuple(raw.keys())
-        self.fps = float(np.asarray(raw["fps"]).reshape(-1)[0])
+        raw_list = [np.load(path, allow_pickle=True) for path in self.npz_paths]
+        self.raw_keys = tuple(raw_list[0].keys())
+        self.fps = float(np.asarray(raw_list[0]["fps"]).reshape(-1)[0])
         self.dt = 1.0 / self.fps
-
-        self.joint_pos = torch.as_tensor(raw["joint_pos"], dtype=dtype)
-        self.joint_vel = torch.as_tensor(raw["joint_vel"], dtype=dtype)
-        self.root_pos_w = torch.as_tensor(raw["body_pos_w"][:, 0, :], dtype=dtype)
+        self.source_files = [str(path) for path in self.npz_paths]
+        self.joint_pos = torch.cat(
+            [torch.as_tensor(raw["joint_pos"], dtype=dtype) for raw in raw_list],
+            dim=0,
+        )
+        self.joint_vel = torch.cat(
+            [torch.as_tensor(raw["joint_vel"], dtype=dtype) for raw in raw_list],
+            dim=0,
+        )
+        self.root_pos_w = torch.cat(
+            [torch.as_tensor(raw["body_pos_w"][:, 0, :], dtype=dtype) for raw in raw_list],
+            dim=0,
+        )
         self.root_quat_w = quat_standardize_wxyz(
-            quat_normalize_wxyz(torch.as_tensor(raw["body_quat_w"][:, 0, :], dtype=dtype))
+            quat_normalize_wxyz(
+                torch.cat(
+                    [torch.as_tensor(raw["body_quat_w"][:, 0, :], dtype=dtype) for raw in raw_list],
+                    dim=0,
+                )
+            )
         )
-        self.root_vel_w = torch.as_tensor(raw["body_lin_vel_w"][:, 0, :], dtype=dtype)
-        self.object_pos_w = torch.as_tensor(raw["object_pos_w"], dtype=dtype)
+        self.root_vel_w = torch.cat(
+            [torch.as_tensor(raw["body_lin_vel_w"][:, 0, :], dtype=dtype) for raw in raw_list],
+            dim=0,
+        )
+        self.object_pos_w = torch.cat(
+            [torch.as_tensor(raw["object_pos_w"], dtype=dtype) for raw in raw_list],
+            dim=0,
+        )
         self.object_quat_w = quat_standardize_wxyz(
-            quat_normalize_wxyz(torch.as_tensor(raw["object_quat_w"], dtype=dtype))
+            quat_normalize_wxyz(
+                torch.cat(
+                    [torch.as_tensor(raw["object_quat_w"], dtype=dtype) for raw in raw_list],
+                    dim=0,
+                )
+            )
         )
-        self.object_vel_w = torch.as_tensor(raw["object_lin_vel_w"], dtype=dtype)
+        self.object_vel_w = torch.cat(
+            [torch.as_tensor(raw["object_lin_vel_w"], dtype=dtype) for raw in raw_list],
+            dim=0,
+        )
 
         self.num_frames = self.joint_pos.shape[0]
 
@@ -215,14 +261,15 @@ class MotionLoader(Dataset):
         self.feature_dim = FEATURE_DIM
 
         self.state_frames = self._build_state_frames()
-        self.motion_slices, self.motion_lengths = self._build_motion_slices(raw)
+        self.motion_slices, self.motion_lengths = self._build_motion_slices(raw_list)
         self.window_index = self._build_window_index()
         if not self.window_index:
+            source_desc = self.npz_paths[0] if len(self.npz_paths) == 1 else f"{len(self.npz_paths)} files"
             raise ValueError(
-                f"No valid windows found in {self.npz_path} with seq_len={self.seq_len} "
+                f"No valid windows found in {source_desc} with seq_len={self.seq_len} "
                 f"and stride={self.stride}."
             )
-        self.state_mean, self.state_std = self._load_or_compute_stats()
+        self.state_mean, self.state_std = self._compute_stats()
 
     def _build_state_frames(self) -> torch.Tensor:
         root_rot6d = quat_to_rot6d(self.root_quat_w)
@@ -241,11 +288,13 @@ class MotionLoader(Dataset):
             dim=-1,
         )
 
-    def _build_motion_slices(self, raw: Any) -> tuple[list[slice], list[int]]:
-        if "motion_lengths" in raw:
-            lengths = [int(v) for v in np.asarray(raw["motion_lengths"]).reshape(-1).tolist()]
-        else:
-            lengths = [self.num_frames]
+    def _build_motion_slices(self, raw_list: list[Any]) -> tuple[list[slice], list[int]]:
+        lengths: list[int] = []
+        for raw in raw_list:
+            if "motion_lengths" in raw:
+                lengths.extend(int(v) for v in np.asarray(raw["motion_lengths"]).reshape(-1).tolist())
+            else:
+                lengths.append(int(np.asarray(raw["joint_pos"]).shape[0]))
         if sum(lengths) != self.num_frames:
             raise ValueError(
                 f"motion_lengths sum {sum(lengths)} does not match number of frames {self.num_frames}"
@@ -273,6 +322,21 @@ class MotionLoader(Dataset):
         return index
 
     def _compute_stats(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.use_stats_cache:
+            digest, payload = _motion_stats_fingerprint(
+                self.npz_paths,
+                self.seq_len,
+                self.stride,
+                self.make_relative_enabled,
+            )
+            cache_root = self.npz_paths[0].parent if len(self.npz_paths) == 1 else DEFAULT_DATA_PATH
+            cache_stem = self.npz_paths[0].stem if len(self.npz_paths) == 1 else "multi_dataset"
+            cache_dir = cache_root / ".gen_hoi_cache"
+            cache_path = cache_dir / f"{cache_stem}_stats_{digest}.json"
+            cached = _try_load_motion_stats_cache(cache_path, digest, self.dtype)
+            if cached is not None:
+                return cached
+
         windows: list[torch.Tensor] = []
         for _, start, end in self.window_index:
             chunk = self.state_frames[start:end]
@@ -286,24 +350,8 @@ class MotionLoader(Dataset):
         mean[self.object_rot6d_slice] = 0.0
         std[self.root_rot6d_slice] = 1.0
         std[self.object_rot6d_slice] = 1.0
-        return mean, std
-
-    def _load_or_compute_stats(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.use_stats_cache:
-            return self._compute_stats()
-        digest, payload = _motion_stats_fingerprint(
-            self.npz_path,
-            self.seq_len,
-            self.stride,
-            self.make_relative_enabled,
-        )
-        cache_dir = self.npz_path.parent / ".gen_hoi_cache"
-        cache_path = cache_dir / f"{self.npz_path.stem}_stats_{digest}.json"
-        cached = _try_load_motion_stats_cache(cache_path, digest, self.dtype)
-        if cached is not None:
-            return cached
-        mean, std = self._compute_stats()
-        _save_motion_stats_cache(cache_path, digest, payload, mean, std)
+        if self.use_stats_cache:
+            _save_motion_stats_cache(cache_path, digest, payload, mean, std)
         return mean, std
 
     def __len__(self) -> int:

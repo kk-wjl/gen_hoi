@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-SRC_DIR = Path(__file__).resolve().parent / "src"
+SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
@@ -29,7 +29,7 @@ from utils.optim import MuonAdamWWrapper
 
 @dataclass
 class DatasetConfig:
-    npz_path: str = "data/train_retargeted_smalltable_replay.npz"
+    npz_path: str = "data"
     seq_len: int = 32
     stride: int = 1
     make_relative: bool = True
@@ -82,6 +82,15 @@ class OutputConfig:
 
 
 @dataclass
+class WandbConfig:
+    enabled: bool = False
+    project: str = "gen-hoi"
+    entity: str | None = None
+    name: str = ""
+    mode: str = "online"
+
+
+@dataclass
 class Config:
     dataset: DatasetConfig = dataclasses.field(default_factory=DatasetConfig)
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
@@ -89,6 +98,7 @@ class Config:
     flow: FlowConfig = dataclasses.field(default_factory=FlowConfig)
     train: TrainConfig = dataclasses.field(default_factory=TrainConfig)
     output: OutputConfig = dataclasses.field(default_factory=OutputConfig)
+    wandb: WandbConfig = dataclasses.field(default_factory=WandbConfig)
     resume: str | None = None
 
 
@@ -127,6 +137,12 @@ def parse_args() -> Config:
     parser.add_argument("--sample-every", type=int, default=TrainConfig.sample_every)
     parser.add_argument("--cond-steps", type=int, default=TrainConfig.cond_steps)
     parser.add_argument("--sample-steps", type=int, default=TrainConfig.sample_steps)
+
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb-project", default=WandbConfig.project)
+    parser.add_argument("--wandb-entity", default=WandbConfig.entity)
+    parser.add_argument("--wandb-name", default="")
+    parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=WandbConfig.mode)
     args = parser.parse_args()
 
     return Config(
@@ -169,6 +185,13 @@ def parse_args() -> Config:
             root_dir=args.output_root,
             run_name=args.run_name,
         ),
+        wandb=WandbConfig(
+            enabled=args.wandb,
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            mode=args.wandb_mode,
+        ),
         resume=args.resume,
     )
 
@@ -197,9 +220,22 @@ def build_run_dir(config: Config) -> Path:
         run_name = config.output.run_name
     else:
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        data_stem = Path(config.dataset.npz_path).stem
+        data_path = Path(config.dataset.npz_path)
+        data_stem = data_path.stem if data_path.suffix == ".npz" else data_path.name
         run_name = f"{stamp}_{data_stem}_T{config.dataset.seq_len}"
     return root_dir / run_name
+
+
+def resolve_data_paths(npz_path: str) -> list[Path]:
+    path = Path(npz_path).expanduser().resolve()
+    if path.is_dir():
+        npz_paths = sorted(path.glob("*.npz"))
+        if not npz_paths:
+            raise ValueError(f"No .npz files found under directory {path}")
+        return npz_paths
+    if path.is_file() and path.suffix == ".npz":
+        return [path]
+    raise ValueError(f"--data must point to a .npz file or a directory of .npz files, got {path}")
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -211,6 +247,28 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
+def setup_wandb(config: Config, run_dir: Path, payload: dict[str, Any]) -> Any | None:
+    if not config.wandb.enabled:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError(
+            "wandb logging is enabled, but the 'wandb' package is not installed. "
+            "Install dependencies and retry, or run without --wandb."
+        ) from exc
+
+    run_name = config.wandb.name or config.output.run_name or run_dir.name
+    return wandb.init(
+        project=config.wandb.project,
+        entity=config.wandb.entity,
+        name=run_name,
+        mode=config.wandb.mode,
+        dir=str(run_dir),
+        config=payload,
+    )
 
 
 def build_optimizer(config: Config, model: torch.nn.Module) -> torch.optim.Optimizer:
@@ -278,9 +336,10 @@ def main() -> None:
     run_dir = build_run_dir(config)
     checkpoint_dir = run_dir / "checkpoints"
     log_path = run_dir / "logs" / "train_metrics.jsonl"
+    data_paths = resolve_data_paths(config.dataset.npz_path)
 
     dataset = MotionLoader(
-        npz_path=config.dataset.npz_path,
+        npz_path=data_paths,
         seq_len=config.dataset.seq_len,
         stride=config.dataset.stride,
         make_relative=config.dataset.make_relative,
@@ -319,16 +378,16 @@ def main() -> None:
     flow.to(device)
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    write_json(
-        run_dir / "config.json",
-        {
-            **asdict(config),
-            "resolved_device": str(device),
-            "feature_dim": dataset.feature_dim,
-            "num_frames": dataset.num_frames,
-            "num_windows": len(dataset),
-        },
-    )
+    run_config = {
+        **asdict(config),
+        "data_files": [str(path) for path in data_paths],
+        "resolved_device": str(device),
+        "feature_dim": dataset.feature_dim,
+        "num_frames": dataset.num_frames,
+        "num_windows": len(dataset),
+        "run_dir": str(run_dir.resolve()),
+    }
+    write_json(run_dir / "config.json", run_config)
     write_json(
         run_dir / "dataset_stats.json",
         {
@@ -336,6 +395,7 @@ def main() -> None:
             "std": dataset.state_std.cpu().tolist(),
         },
     )
+    wandb_run = setup_wandb(config, run_dir, run_config)
 
     start_epoch = 0
     best_loss = float("inf")
@@ -408,6 +468,8 @@ def main() -> None:
 
         append_jsonl(log_path, metrics)
         print(json.dumps(metrics, ensure_ascii=True))
+        if wandb_run is not None:
+            wandb_run.log(metrics, step=epoch + 1)
 
         save_training_checkpoint(
             latest_ckpt,
@@ -435,6 +497,9 @@ def main() -> None:
                 config=asdict(config),
                 extra={"best_loss": best_loss},
             )
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
