@@ -42,15 +42,13 @@ class FlowConfig:
 @dataclass
 class TrainConfig:
     batch_size: int = 64
-    epochs: int = 100
+    epochs: int = 50
     num_workers: int = 0
     seed: int = 42
     device: str = "cuda"
-    log_every: int = 10
-    save_every: int = 5
-    sample_every: int = 5
+    log_every: int = 10 # terminal logs every N steps
+    save_every: int = 5 # save checkpoints every N epochs
     cond_steps: int = 8
-    sample_steps: int = 50
 
 
 @dataclass
@@ -78,6 +76,23 @@ class Config:
     output: OutputConfig = dataclasses.field(default_factory=OutputConfig)
     wandb: WandbConfig = dataclasses.field(default_factory=WandbConfig)
     resume: str | None = None
+
+
+def config_from_dict(values: dict[str, object]) -> Config:
+    def convert(cls: type, raw: dict[str, object]) -> object:
+        instance = cls()
+        for field in dataclasses.fields(instance):
+            if field.name not in raw:
+                continue
+            current_value = getattr(instance, field.name)
+            raw_value = raw[field.name]
+            if dataclasses.is_dataclass(current_value) and isinstance(raw_value, dict):
+                setattr(instance, field.name, convert(type(current_value), raw_value))
+            else:
+                setattr(instance, field.name, raw_value)
+        return instance
+
+    return convert(Config, values)  # type: ignore[return-value]
 
 
 def parse_args() -> Config:
@@ -112,9 +127,7 @@ def parse_args() -> Config:
 
     parser.add_argument("--log-every", type=int, default=TrainConfig.log_every)
     parser.add_argument("--save-every", type=int, default=TrainConfig.save_every)
-    parser.add_argument("--sample-every", type=int, default=TrainConfig.sample_every)
     parser.add_argument("--cond-steps", type=int, default=TrainConfig.cond_steps)
-    parser.add_argument("--sample-steps", type=int, default=TrainConfig.sample_steps)
 
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb-project", default=WandbConfig.project)
@@ -155,9 +168,7 @@ def parse_args() -> Config:
             device=args.device,
             log_every=args.log_every,
             save_every=args.save_every,
-            sample_every=args.sample_every,
             cond_steps=args.cond_steps,
-            sample_steps=args.sample_steps,
         ),
         output=OutputConfig(
             root_dir=args.output_root,

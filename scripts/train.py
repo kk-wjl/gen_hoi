@@ -80,45 +80,6 @@ def build_optimizer(config: Config, model: torch.nn.Module) -> torch.optim.Optim
     )
 
 
-def save_sample(
-    *,
-    flow: LinearFlow,
-    dataset: MotionLoader,
-    device: torch.device,
-    batch: dict[str, Any],
-    run_dir: Path,
-    epoch: int,
-    cond_steps: int,
-    sample_steps: int,
-) -> dict[str, float]:
-    chunks = batch["chunk"][:1].to(device)
-    cond_prefix = chunks[:, :cond_steps]
-    pred = flow.sample(
-        num_steps=sample_steps,
-        cond_prefix=cond_prefix,
-        device=device,
-    )
-
-    pred_cpu = pred.detach().cpu()
-    target_cpu = chunks.detach().cpu()
-    pred_denorm = dataset.denormalize(pred_cpu) if dataset.normalize_enabled else pred_cpu
-    target_denorm = dataset.denormalize(target_cpu) if dataset.normalize_enabled else target_cpu
-    metrics = dataset.metrics(pred_cpu, target_cpu, normalized=True)
-
-    sample_dir = run_dir / "samples"
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        sample_dir / f"epoch_{epoch:04d}.npz",
-        pred=pred_cpu.numpy(),
-        target=target_cpu.numpy(),
-        pred_denorm=pred_denorm.numpy(),
-        target_denorm=target_denorm.numpy(),
-        cond_steps=np.asarray([cond_steps], dtype=np.int64),
-        sample_steps=np.asarray([sample_steps], dtype=np.int64),
-    )
-    return metrics
-
-
 def main() -> None:
     config = parse_args()
     seed(config.train.seed)
@@ -196,16 +157,13 @@ def main() -> None:
     wandb_run = setup_wandb(config, run_dir, run_config)
 
     start_epoch = 0
-    best_loss = float("inf")
     latest_ckpt = checkpoint_dir / "latest.pt"
     if config.resume is not None:
         resume_path = Path(config.resume)
         start_epoch = load_training_checkpoint(resume_path, model, optimizer, map_location=device)
-        best_loss = torch.load(resume_path, map_location="cpu", weights_only=False).get("best_loss", best_loss)
         print(f"Resumed from {resume_path} at epoch {start_epoch}")
     elif latest_ckpt.is_file():
         start_epoch = load_training_checkpoint(latest_ckpt, model, optimizer, map_location=device)
-        best_loss = torch.load(latest_ckpt, map_location="cpu", weights_only=False).get("best_loss", best_loss)
         print(f"Auto-resumed from {latest_ckpt} at epoch {start_epoch}")
 
     for epoch in range(start_epoch, config.train.epochs):
@@ -216,11 +174,9 @@ def main() -> None:
             total=len(dataloader),
             desc=f"epoch {epoch + 1}/{config.train.epochs}",
         )
-        last_batch: dict[str, Any] | None = None
 
         for step, batch in progress:
             chunks = batch["chunk"].to(device)
-            last_batch = batch
 
             optimizer.zero_grad(set_to_none=True)
             loss = flow.compute_loss(x1=chunks, cond_steps=config.train.cond_steps)
@@ -245,25 +201,6 @@ def main() -> None:
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
 
-        if last_batch is not None and (
-            (epoch + 1) % config.train.sample_every == 0 or epoch + 1 == config.train.epochs
-        ):
-            model.eval()
-            sample_metrics = save_sample(
-                flow=flow,
-                dataset=dataset,
-                device=device,
-                batch=last_batch,
-                run_dir=run_dir,
-                epoch=epoch + 1,
-                cond_steps=config.train.cond_steps,
-                sample_steps=config.train.sample_steps,
-            )
-            metrics.update(sample_metrics)
-
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(metrics, ensure_ascii=True) + "\n")
@@ -277,7 +214,6 @@ def main() -> None:
             model=model,
             optimizer=optimizer,
             config=asdict(config),
-            extra={"best_loss": best_loss},
         )
         if (epoch + 1) % config.train.save_every == 0:
             save_training_checkpoint(
@@ -286,16 +222,6 @@ def main() -> None:
                 model=model,
                 optimizer=optimizer,
                 config=asdict(config),
-                extra={"best_loss": best_loss},
-            )
-        if best_loss == epoch_loss:
-            save_training_checkpoint(
-                checkpoint_dir / "best.pt",
-                epoch=epoch + 1,
-                model=model,
-                optimizer=optimizer,
-                config=asdict(config),
-                extra={"best_loss": best_loss},
             )
 
     if wandb_run is not None:

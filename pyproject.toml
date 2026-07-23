@@ -1,13 +1,22 @@
 [project]
 name = "gen-hoi"
 version = "0.1.0"
-description = "Add your description here"
+description = "Human-object interaction generation"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.13,<3.14"
+
 dependencies = [
     "jaxtyping>=0.3.2",
     "numpy>=2.3.1",
-    "torch>=2.8.0",
+    "torch==2.11.0",
     "tqdm>=4.67.1",
     "wandb>=0.21.0",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
