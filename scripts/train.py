@@ -32,28 +32,10 @@ def seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_run_dir(config: Config) -> Path:
-    root_dir = Path(config.output.root_dir)
-    if config.output.run_name:
-        run_name = config.output.run_name
-    else:
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        data_path = Path(config.dataset.npz_path)
-        data_stem = data_path.stem if data_path.suffix == ".npz" else data_path.name
-        run_name = f"{stamp}_{data_stem}_T{config.dataset.seq_len}"
-    return root_dir / run_name
-
-
 def setup_wandb(config: Config, run_dir: Path, payload: dict[str, Any]) -> Any | None:
     if not config.wandb.enabled:
         return None
-    try:
-        import wandb
-    except ImportError as exc:
-        raise ImportError(
-            "wandb logging is enabled, but the 'wandb' package is not installed. "
-            "Install dependencies and retry, or run without --wandb."
-        ) from exc
+    import wandb
 
     run_name = config.wandb.name or config.output.run_name or run_dir.name
     return wandb.init(
@@ -84,7 +66,12 @@ def main() -> None:
     config = parse_args()
     seed(config.train.seed)
     device = torch.device(config.train.device)
-    run_dir = build_run_dir(config)
+    root_dir = Path(config.output.root_dir)
+    if config.output.run_name:
+        run_name = config.output.run_name
+    else:
+        run_name = time.strftime("%Y-%m%d-%H%M")
+    run_dir = root_dir / run_name
     checkpoint_dir = run_dir / "checkpoints"
     log_path = run_dir / "logs" / "train_metrics.jsonl"
 
@@ -169,6 +156,7 @@ def main() -> None:
     for epoch in range(start_epoch, config.train.epochs):
         model.train()
         epoch_losses: list[float] = []
+        epoch_grad_norms: list[float] = []
         progress = tqdm(
             enumerate(dataloader, start=1),
             total=len(dataloader),
@@ -186,19 +174,20 @@ def main() -> None:
             optimizer.step()
 
             loss_value = float(loss.detach().item())
+            grad_norm_value = float(grad_norm)
             epoch_losses.append(loss_value)
+            epoch_grad_norms.append(grad_norm_value)
 
             if step % config.train.log_every == 0 or step == len(dataloader):
                 progress.set_postfix(
                     loss=f"{loss_value:.5f}",
-                    grad=f"{float(grad_norm):.3f}",
                 )
 
-        epoch_loss = float(np.mean(epoch_losses))
         metrics: dict[str, float | int] = {
             "epoch": epoch + 1,
-            "loss": epoch_loss,
-            "lr": float(optimizer.param_groups[0]["lr"]),
+            "train/loss": float(np.mean(epoch_losses)),
+            "train/lr": float(optimizer.param_groups[0]["lr"]),
+            "train/grad_norm": float(np.mean(epoch_grad_norms)),
         }
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -206,7 +195,8 @@ def main() -> None:
             f.write(json.dumps(metrics, ensure_ascii=True) + "\n")
         print(json.dumps(metrics, ensure_ascii=True))
         if wandb_run is not None:
-            wandb_run.log(metrics, step=epoch + 1)
+            epoch_end_step = (epoch + 1) * len(dataloader)
+            wandb_run.log(metrics, step=epoch_end_step)
 
         save_training_checkpoint(
             latest_ckpt,

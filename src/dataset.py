@@ -464,29 +464,29 @@ class MotionLoader(Dataset):
         }
 
 
-    def metrics(self, pred: torch.Tensor, target: torch.Tensor, *, normalized: bool = True) -> dict[str, float]:
-        pred_chunk = pred.clone()
-        target_chunk = target.clone()
+    def metrics(self, chunk: torch.Tensor, *, normalized: bool = True) -> dict[str, float]:
+        chunk = chunk.clone()
         if normalized and self.normalize_enabled:
-            pred_chunk = self.denormalize(pred_chunk)
-            target_chunk = self.denormalize(target_chunk)
+            chunk = self.denormalize(chunk)
 
-        pred_root_pos = pred_chunk[..., self.root_pos_slice]
-        target_root_pos = target_chunk[..., self.root_pos_slice]
-        pred_joint_pos = pred_chunk[..., self.joint_pos_slice]
-        target_joint_pos = target_chunk[..., self.joint_pos_slice]
+        if chunk.shape[-2] < 2:
+            return {"root_vel_fd_mse": 0.0, "joint_vel_fd_mse": 0.0, "object_vel_fd_mse": 0.0}
 
-        if pred_chunk.shape[-2] < 2:
-            return {"root_vel_fd_mse": 0.0, "joint_vel_fd_mse": 0.0}
+        root_pos = chunk[..., self.root_pos_slice]
+        root_vel = chunk[..., self.root_vel_slice]
+        joint_pos = chunk[..., self.joint_pos_slice]
+        joint_vel = chunk[..., self.joint_vel_slice]
+        object_pos = chunk[..., self.object_pos_slice]
+        object_vel = chunk[..., self.object_vel_slice]
 
-        pred_root_vel = torch.diff(pred_root_pos, dim=-2) * self.fps
-        target_root_vel = torch.diff(target_root_pos, dim=-2) * self.fps
-        pred_joint_vel = torch.diff(pred_joint_pos, dim=-2) * self.fps
-        target_joint_vel = torch.diff(target_joint_pos, dim=-2) * self.fps
+        root_vel_fd = torch.diff(root_pos, dim=-2) * self.fps
+        joint_vel_fd = torch.diff(joint_pos, dim=-2) * self.fps
+        object_vel_fd = torch.diff(object_pos, dim=-2) * self.fps
 
         return {
-            "root_vel_fd_mse": torch.mean((pred_root_vel - target_root_vel) ** 2).item(),
-            "joint_vel_fd_mse": torch.mean((pred_joint_vel - target_joint_vel) ** 2).item(),
+            "root_vel_fd_mse": torch.mean((root_vel[1:] - root_vel_fd) ** 2).item(),
+            "joint_vel_fd_mse": torch.mean((joint_vel[1:] - joint_vel_fd) ** 2).item(),
+            "object_vel_fd_mse": torch.mean((object_vel[1:] - object_vel_fd) ** 2).item(),
         }
 
     def get_stats(self) -> dict[str, torch.Tensor]:

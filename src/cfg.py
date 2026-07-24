@@ -17,8 +17,8 @@ class DatasetConfig:
 
 @dataclass
 class ModelConfig:
-    hidden_size: int = 256
-    depth: int = 8
+    hidden_size: int = 512
+    depth: int = 12
     num_heads: int = 8
     mlp_ratio: float = 4.0
     dropout: float = 0.0
@@ -59,7 +59,7 @@ class OutputConfig:
 
 @dataclass
 class WandbConfig:
-    enabled: bool = False
+    enabled: bool = True
     project: str = "gen-hoi"
     entity: str | None = None
     name: str = ""
@@ -99,7 +99,7 @@ def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Train the HOI diffusion transformer.")
     parser.add_argument("--data", default=DatasetConfig.npz_path)
     parser.add_argument("--output-root", default=OutputConfig.root_dir)
-    parser.add_argument("--run-name", default="")
+    parser.add_argument("--run-name", default=OutputConfig.run_name)
     parser.add_argument("--resume", default=None)
 
     parser.add_argument("--seq-len", type=int, default=DatasetConfig.seq_len)
@@ -129,10 +129,10 @@ def parse_args() -> Config:
     parser.add_argument("--save-every", type=int, default=TrainConfig.save_every)
     parser.add_argument("--cond-steps", type=int, default=TrainConfig.cond_steps)
 
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb", default=WandbConfig.enabled)
     parser.add_argument("--wandb-project", default=WandbConfig.project)
     parser.add_argument("--wandb-entity", default=WandbConfig.entity)
-    parser.add_argument("--wandb-name", default="")
+    parser.add_argument("--wandb-name", default=WandbConfig.name)
     parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=WandbConfig.mode)
     args = parser.parse_args()
 

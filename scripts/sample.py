@@ -78,11 +78,10 @@ def choose_indices(dataset_len: int, num_rollouts: int, seed: int) -> list[int]:
 def rollout_to_world_pose(
     dataset: MotionLoader,
     pred_chunk: torch.Tensor,
-    start: int,
-    end: int,
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, float]]:
-    target_world_chunk = dataset.state_frames[start:end].clone()
-    anchor_pose = dataset.chunk_to_pose(target_world_chunk[0:1])
+    
+    anchor_frame: torch.Tensor,
+) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+    anchor_pose = dataset.chunk_to_pose(anchor_frame)
     pred_world_chunk = dataset.accumulate_chunk_in_anchor_frame(
         pred_chunk,
         root0_pos=anchor_pose["root_pos"][0],
@@ -91,9 +90,8 @@ def rollout_to_world_pose(
         object0_quat=anchor_pose["object_quat"][0],
     )
     pred_pose = dataset.chunk_to_pose(pred_world_chunk)
-    target_pose = dataset.chunk_to_pose(target_world_chunk)
-    metrics = dataset.metrics(pred_world_chunk, target_world_chunk, normalized=False)
-    return pred_pose, target_pose, metrics
+    metrics = dataset.metrics(pred_world_chunk, normalized=False)
+    return pred_pose, metrics
 
 
 def save_rollout_npz(path: Path, pose: dict[str, torch.Tensor], fps: float) -> None:
@@ -107,6 +105,13 @@ def save_rollout_npz(path: Path, pose: dict[str, torch.Tensor], fps: float) -> N
         object_quat=pose["object_quat"].cpu().numpy(),
         fps=np.asarray([fps], dtype=np.float32),
     )
+
+
+def cat_rollout_poses(poses: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    if not poses:
+        raise ValueError("poses must contain at least one rollout")
+    keys = ("joint_pos", "root_pos", "root_quat", "object_pos", "object_quat")
+    return {key: torch.cat([pose[key] for pose in poses], dim=0) for key in keys}
 
 
 def main() -> None:
@@ -152,6 +157,7 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "rollout_metrics.jsonl"
+    rollout_poses: list[dict[str, torch.Tensor]] = []
 
     with metrics_path.open("w", encoding="utf-8") as metrics_file:
         for rollout_id, dataset_index in enumerate(indices):
@@ -169,16 +175,17 @@ def main() -> None:
                 )[0].detach().cpu()
 
             pred_denorm = dataset.denormalize(pred_chunk) if dataset.normalize_enabled else pred_chunk
-            pred_pose, target_pose, metrics = rollout_to_world_pose(
+            anchor_frame = dataset.state_frames[start : start + 1].clone()
+            pred_pose, metrics = rollout_to_world_pose(
                 dataset,
                 pred_chunk=pred_denorm,
-                start=start,
-                end=end,
+                anchor_frame=anchor_frame,
             )
 
             rollout_name = f"rollout_{rollout_id:03d}.npz"
             rollout_path = output_dir / rollout_name
             save_rollout_npz(rollout_path, pred_pose, dataset.fps)
+            rollout_poses.append(pred_pose)
 
             record = {
                 "rollout_id": rollout_id,
@@ -194,11 +201,12 @@ def main() -> None:
                 "data_files": [str(path) for path in dataset.npz_paths],
                 "root_vel_fd_mse": metrics["root_vel_fd_mse"],
                 "joint_vel_fd_mse": metrics["joint_vel_fd_mse"],
-                "target_root_pos_0": target_pose["root_pos"][0].cpu().tolist(),
-                "target_object_pos_0": target_pose["object_pos"][0].cpu().tolist(),
+                "object_vel_fd_mse": metrics["object_vel_fd_mse"],
             }
             metrics_file.write(json.dumps(record, ensure_ascii=True) + "\n")
             print(json.dumps(record, ensure_ascii=True))
+
+    save_rollout_npz(output_dir / "rollout.npz", cat_rollout_poses(rollout_poses), dataset.fps)
 
 
 if __name__ == "__main__":
