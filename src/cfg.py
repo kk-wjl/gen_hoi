@@ -42,19 +42,19 @@ class FlowConfig:
 @dataclass
 class TrainConfig:
     batch_size: int = 64
-    epochs: int = 50
+    epochs: int = 80
     num_workers: int = 0
     seed: int = 42
     device: str = "cuda"
     log_every: int = 10 # terminal logs every N steps
-    save_every: int = 5 # save checkpoints every N epochs
+    save_every: int = 10 # save checkpoints every N epochs
     cond_steps: int = 8
 
 
 @dataclass
 class OutputConfig:
     root_dir: str = "outputs"
-    run_name: str = ""
+    run_name: str = "Baseline"
 
 
 @dataclass

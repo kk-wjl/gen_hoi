@@ -62,6 +62,58 @@ def build_optimizer(config: Config, model: torch.nn.Module) -> torch.optim.Optim
     )
 
 
+def compute_metrics(
+    *,
+    flow: LinearFlow,
+    dataset: MotionLoader,
+    seed: int,
+    eval_count: int,
+    cond_steps: int,
+    num_steps: int,
+    device: torch.device,
+) -> dict[str, float]:
+    metric_sums = {
+        "root_vel_fd_mse": 0.0,
+        "joint_vel_fd_mse": 0.0,
+        "object_vel_fd_mse": 0.0,
+    }
+    eval_rng = np.random.default_rng(seed)
+    eval_indices = [
+        int(index) for index in eval_rng.choice(len(dataset), size=eval_count, replace=False).tolist()
+    ]
+    if not eval_indices:
+        return metric_sums
+
+    with torch.inference_mode():
+        for dataset_index in eval_indices:
+            sample = dataset[dataset_index]
+            chunk = sample["chunk"]
+            _, start, _ = sample["meta"]
+
+            cond_prefix = chunk.unsqueeze(0)[:, :cond_steps].to(device)
+            pred_chunk = flow.sample(
+                num_steps=num_steps,
+                cond_prefix=cond_prefix,
+                device=device,
+            )[0].detach().cpu()
+
+            pred_denorm = dataset.denormalize(pred_chunk) if dataset.normalize_enabled else pred_chunk
+            anchor_frame = dataset.state_frames[start : start + 1].clone()
+            anchor_pose = dataset.chunk_to_pose(anchor_frame)
+            pred_world_chunk = dataset.accumulate_chunk_in_anchor_frame(
+                pred_denorm,
+                root0_pos=anchor_pose["root_pos"][0],
+                root0_quat=anchor_pose["root_quat"][0],
+                object0_pos=anchor_pose["object_pos"][0],
+                object0_quat=anchor_pose["object_quat"][0],
+            )
+            metrics = dataset.metrics(pred_world_chunk, normalized=False)
+            for key in metric_sums:
+                metric_sums[key] += metrics[key]
+
+    count = float(len(eval_indices))
+    return {key: value / count for key, value in metric_sums.items()}
+
 def main() -> None:
     config = parse_args()
     seed(config.train.seed)
@@ -104,6 +156,10 @@ def main() -> None:
     )
     model.sample_shape = (config.dataset.seq_len, dataset.feature_dim)
     model.to(device)
+    num_parameters = sum(param.numel() for param in model.parameters())
+    trainable_parameters = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else None
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
     optimizer = build_optimizer(config, model)
     flow = LinearFlow(
@@ -123,12 +179,18 @@ def main() -> None:
         "num_frames": dataset.num_frames,
         "num_windows": len(dataset),
         "run_dir": str(run_dir.resolve()),
+        "num_parameters": num_parameters,
+        "trainable_parameters": trainable_parameters,
+        "gpu_name": gpu_name,
+        "gpu_count": gpu_count,
+        "total_time_sec": None,
+        "peak_gpu_memory_allocated_mb": None,
+        "peak_gpu_memory_reserved_mb": None,
     }
-    config_path = run_dir / "config.json"
+    config_path = run_dir / "logs" / "config.json"
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(run_config, ensure_ascii=True, indent=2), encoding="utf-8")
 
-    dataset_stats_path = run_dir / "dataset_stats.json"
+    dataset_stats_path = run_dir / "logs" / "dataset_stats.json"
     dataset_stats_path.parent.mkdir(parents=True, exist_ok=True)
     dataset_stats_path.write_text(
         json.dumps(
@@ -145,16 +207,39 @@ def main() -> None:
 
     start_epoch = 0
     latest_ckpt = checkpoint_dir / "latest.pt"
+    train_start_time = time.perf_counter()
+    peak_gpu_memory_allocated_mb = 0.0
+    peak_gpu_memory_reserved_mb = 0.0
+    previous_total_time_sec = 0.0
+    previous_peak_gpu_memory_allocated_mb = 0.0
+    previous_peak_gpu_memory_reserved_mb = 0.0
     if config.resume is not None:
         resume_path = Path(config.resume)
+        resume_config_path = resume_path.resolve().parent.parent / "logs" / "config.json"
+        if resume_config_path.is_file():
+            try:
+                previous_run_config = json.loads(resume_config_path.read_text(encoding="utf-8"))
+            except Exception:
+                previous_run_config = None
+            if isinstance(previous_run_config, dict):
+                previous_total_time_sec = float(previous_run_config.get("total_time_sec") or 0.0)
+                previous_peak_gpu_memory_allocated_mb = float(
+                    previous_run_config.get("peak_gpu_memory_allocated_mb") or 0.0
+                )
+                previous_peak_gpu_memory_reserved_mb = float(
+                    previous_run_config.get("peak_gpu_memory_reserved_mb") or 0.0
+                )
         start_epoch = load_training_checkpoint(resume_path, model, optimizer, map_location=device)
         print(f"Resumed from {resume_path} at epoch {start_epoch}")
     elif latest_ckpt.is_file():
         start_epoch = load_training_checkpoint(latest_ckpt, model, optimizer, map_location=device)
         print(f"Auto-resumed from {latest_ckpt} at epoch {start_epoch}")
+    config_path.write_text(json.dumps(run_config, ensure_ascii=True, indent=2), encoding="utf-8")
 
     for epoch in range(start_epoch, config.train.epochs):
         model.train()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         epoch_losses: list[float] = []
         epoch_grad_norms: list[float] = []
         progress = tqdm(
@@ -182,14 +267,22 @@ def main() -> None:
                 progress.set_postfix(
                     loss=f"{loss_value:.5f}",
                 )
-
+        model.eval()
         metrics: dict[str, float | int] = {
             "epoch": epoch + 1,
-            "train/loss": float(np.mean(epoch_losses)),
-            "train/lr": float(optimizer.param_groups[0]["lr"]),
-            "train/grad_norm": float(np.mean(epoch_grad_norms)),
+            "loss": float(np.mean(epoch_losses)),
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "grad_norm": float(np.mean(epoch_grad_norms)),
+            **compute_metrics(
+                flow=flow,
+                dataset=dataset,
+                seed=config.train.seed,
+                eval_count=6,
+                cond_steps=config.train.cond_steps,
+                num_steps=50,
+                device=device,
+            )
         }
-
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(metrics, ensure_ascii=True) + "\n")
@@ -214,7 +307,32 @@ def main() -> None:
                 config=asdict(config),
             )
 
+        if device.type == "cuda":
+            peak_gpu_memory_allocated_mb = max(
+                peak_gpu_memory_allocated_mb,
+                torch.cuda.max_memory_allocated(device) / (1024 ** 2),
+                previous_peak_gpu_memory_allocated_mb,
+            )
+            peak_gpu_memory_reserved_mb = max(
+                peak_gpu_memory_reserved_mb,
+                torch.cuda.max_memory_reserved(device) / (1024 ** 2),
+                previous_peak_gpu_memory_reserved_mb,
+            )
+
+    run_config["total_time_sec"] = time.perf_counter() - train_start_time + previous_total_time_sec
+    if device.type == "cuda":
+        run_config["peak_gpu_memory_allocated_mb"] = peak_gpu_memory_allocated_mb
+        run_config["peak_gpu_memory_reserved_mb"] = peak_gpu_memory_reserved_mb
+    config_path.write_text(json.dumps(run_config, ensure_ascii=True, indent=2), encoding="utf-8")
+
     if wandb_run is not None:
+        wandb_run.summary["total_time_sec"] = run_config["total_time_sec"]
+        wandb_run.summary["num_parameters"] = run_config["num_parameters"]
+        wandb_run.summary["trainable_parameters"] = run_config["trainable_parameters"]
+        wandb_run.summary["gpu_name"] = run_config["gpu_name"]
+        wandb_run.summary["gpu_count"] = run_config["gpu_count"]
+        wandb_run.summary["peak_gpu_memory_allocated_mb"] = run_config["peak_gpu_memory_allocated_mb"]
+        wandb_run.summary["peak_gpu_memory_reserved_mb"] = run_config["peak_gpu_memory_reserved_mb"]
         wandb_run.finish()
 
 

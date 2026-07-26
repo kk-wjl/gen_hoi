@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-rollouts", type=int, default=6)
     parser.add_argument("--num-steps", type=int, default=50)
     parser.add_argument("--cond-steps", type=int, default=None)
+    parser.add_argument("--num-windows", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None, help="Override device. Defaults to the checkpoint config value.")
     return parser.parse_args()
@@ -75,25 +76,6 @@ def choose_indices(dataset_len: int, num_rollouts: int, seed: int) -> list[int]:
     return [int(index) for index in indices.tolist()]
 
 
-def rollout_to_world_pose(
-    dataset: MotionLoader,
-    pred_chunk: torch.Tensor,
-    
-    anchor_frame: torch.Tensor,
-) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
-    anchor_pose = dataset.chunk_to_pose(anchor_frame)
-    pred_world_chunk = dataset.accumulate_chunk_in_anchor_frame(
-        pred_chunk,
-        root0_pos=anchor_pose["root_pos"][0],
-        root0_quat=anchor_pose["root_quat"][0],
-        object0_pos=anchor_pose["object_pos"][0],
-        object0_quat=anchor_pose["object_quat"][0],
-    )
-    pred_pose = dataset.chunk_to_pose(pred_world_chunk)
-    metrics = dataset.metrics(pred_world_chunk, normalized=False)
-    return pred_pose, metrics
-
-
 def save_rollout_npz(path: Path, pose: dict[str, torch.Tensor], fps: float) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -113,6 +95,60 @@ def cat_rollout_poses(poses: list[dict[str, torch.Tensor]]) -> dict[str, torch.T
     keys = ("joint_pos", "root_pos", "root_quat", "object_pos", "object_quat")
     return {key: torch.cat([pose[key] for pose in poses], dim=0) for key in keys}
 
+def sliding_rollout(
+    dataset: MotionLoader,
+    flow: LinearFlow,
+    target_chunk: torch.Tensor,
+    anchor_frame: torch.Tensor,
+    *,
+    cond_steps: int,
+    num_steps: int,
+    num_windows: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if num_windows < 1:
+        raise ValueError(f"num_windows must be >= 1, got {num_windows}")
+
+    seq_len = target_chunk.shape[1]
+    overlap_start = seq_len - cond_steps
+    cond_prefix = target_chunk[:, :cond_steps].to(device)
+    current_anchor = anchor_frame.clone()
+    rollout_chunks: list[torch.Tensor] = []
+
+    for window_idx in range(num_windows):
+        with torch.inference_mode():
+            pred_chunk = flow.sample(
+                num_steps=num_steps,
+                cond_prefix=cond_prefix,
+                device=device,
+            )[0].detach().cpu()
+
+        pred_denorm = dataset.denormalize(pred_chunk) if dataset.normalize_enabled else pred_chunk
+        anchor_pose = dataset.chunk_to_pose(current_anchor)
+        pred_world_chunk = dataset.accumulate_chunk_in_anchor_frame(
+            pred_denorm,
+            root0_pos=anchor_pose["root_pos"][0],
+            root0_quat=anchor_pose["root_quat"][0],
+            object0_pos=anchor_pose["object_pos"][0],
+            object0_quat=anchor_pose["object_quat"][0],
+        )
+
+        if window_idx == 0:
+            rollout_chunks.append(pred_world_chunk)
+        else:
+            rollout_chunks.append(pred_world_chunk[cond_steps:])
+
+        if window_idx == num_windows - 1:
+            break
+
+        next_cond_world = pred_world_chunk[overlap_start:].clone()
+        current_anchor = next_cond_world[:1].clone()
+        next_cond_chunk = dataset.make_relative(next_cond_world) if dataset.make_relative_enabled else next_cond_world
+        if dataset.normalize_enabled:
+            next_cond_chunk = dataset.normalize(next_cond_chunk)
+        cond_prefix = next_cond_chunk.unsqueeze(0).to(device)
+
+    return torch.cat(rollout_chunks, dim=0)
 
 def main() -> None:
     args = parse_args()
@@ -143,6 +179,8 @@ def main() -> None:
             f"cond_steps must be in [1, seq_len - 1], got cond_steps={cond_steps}, "
             f"seq_len={config.dataset.seq_len}"
         )
+    if args.num_windows < 1:
+        raise ValueError(f"num_windows must be >= 1, got {args.num_windows}")
 
     dataset = MotionLoader(
         npz_path=config.dataset.npz_path,
@@ -166,21 +204,19 @@ def main() -> None:
             motion_id, start, end = sample["meta"]
 
             target_chunk = chunk.unsqueeze(0)
-            cond_prefix = target_chunk[:, :cond_steps].to(device)
-            with torch.inference_mode():
-                pred_chunk = flow.sample(
-                    num_steps=args.num_steps,
-                    cond_prefix=cond_prefix,
-                    device=device,
-                )[0].detach().cpu()
-
-            pred_denorm = dataset.denormalize(pred_chunk) if dataset.normalize_enabled else pred_chunk
             anchor_frame = dataset.state_frames[start : start + 1].clone()
-            pred_pose, metrics = rollout_to_world_pose(
+            pred_world_chunk = sliding_rollout(
                 dataset,
-                pred_chunk=pred_denorm,
+                flow,
+                target_chunk,
                 anchor_frame=anchor_frame,
+                cond_steps=cond_steps,
+                num_steps=args.num_steps,
+                num_windows=args.num_windows,
+                device=device,
             )
+            pred_pose = dataset.chunk_to_pose(pred_world_chunk)
+            metrics = dataset.metrics(pred_world_chunk, normalized=False)
 
             rollout_name = f"rollout_{rollout_id:03d}.npz"
             rollout_path = output_dir / rollout_name
@@ -196,6 +232,8 @@ def main() -> None:
                 "end": end,
                 "cond_steps": cond_steps,
                 "num_steps": args.num_steps,
+                "num_windows": args.num_windows,
+                "num_frames": int(pred_world_chunk.shape[0]),
                 "checkpoint_path": str(checkpoint_path),
                 "checkpoint_epoch": checkpoint_epoch,
                 "data_files": [str(path) for path in dataset.npz_paths],
@@ -204,7 +242,7 @@ def main() -> None:
                 "object_vel_fd_mse": metrics["object_vel_fd_mse"],
             }
             metrics_file.write(json.dumps(record, ensure_ascii=True) + "\n")
-            print(json.dumps(record, ensure_ascii=True))
+            print(json.dumps(record, ensure_ascii=True, indent=2))
 
     save_rollout_npz(output_dir / "rollout.npz", cat_rollout_poses(rollout_poses), dataset.fps)
 
