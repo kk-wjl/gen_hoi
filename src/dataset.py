@@ -194,6 +194,7 @@ class MotionLoader(Dataset):
         make_relative: bool = True,
         normalize: bool = True,
         use_stats_cache: bool = True,
+        use_vel: bool = True, # To avoid the raw dataset error
         dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
@@ -208,6 +209,7 @@ class MotionLoader(Dataset):
         self.make_relative_enabled = make_relative
         self.normalize_enabled = normalize
         self.use_stats_cache = use_stats_cache
+        self.use_vel = use_vel
         self.dtype = dtype
 
         raw_list = [np.load(path, allow_pickle=True) for path in self.npz_paths]
@@ -256,6 +258,7 @@ class MotionLoader(Dataset):
         )
 
         self.num_frames = self.joint_pos.shape[0]
+        self.motion_slices, self.motion_lengths = self._build_motion_slices(raw_list)
 
         self.joint_pos_slice = slice(JOINT_POS_START, JOINT_POS_END)
         self.joint_vel_slice = slice(JOINT_VEL_START, JOINT_VEL_END)
@@ -268,7 +271,6 @@ class MotionLoader(Dataset):
         self.feature_dim = FEATURE_DIM
 
         self.state_frames = self._build_state_frames()
-        self.motion_slices, self.motion_lengths = self._build_motion_slices(raw_list)
         self.window_index = self._build_window_index()
         if not self.window_index:
             source_desc = self.npz_paths[0] if len(self.npz_paths) == 1 else f"{len(self.npz_paths)} files"
@@ -278,22 +280,41 @@ class MotionLoader(Dataset):
             )
         self.state_mean, self.state_std = self._compute_stats()
 
+    def _pos_to_vel(self, pos: torch.Tensor) -> torch.Tensor:
+        vel = torch.zeros_like(pos)
+        for motion_slice in self.motion_slices:
+            motion_pos = pos[motion_slice]
+            if motion_pos.shape[0] > 1:
+                motion_vel = torch.diff(motion_pos, dim=0) * self.fps
+                vel[motion_slice][0] = motion_vel[0]
+                vel[motion_slice][1:] = motion_vel
+        return vel
+
     def _build_state_frames(self) -> torch.Tensor:
         root_rot6d = quat_to_rot6d(self.root_quat_w)
         object_rot6d = quat_to_rot6d(self.object_quat_w)
-        return torch.cat(
-            [
-                self.joint_pos,
-                self.joint_vel,
-                self.root_pos_w,
-                root_rot6d,
-                self.root_vel_w,
-                self.object_pos_w,
-                object_rot6d,
-                self.object_vel_w,
-            ],
-            dim=-1,
-        )
+        if self.use_vel:
+            joint_vel = self.joint_vel
+            root_vel_w = self.root_vel_w
+            object_vel_w = self.object_vel_w
+        else:
+            joint_vel = self._pos_to_vel(self.joint_pos)
+            root_vel_w = self._pos_to_vel(self.root_pos_w)
+            object_vel_w = self._pos_to_vel(self.object_pos_w)
+        chunk = torch.cat(
+                [
+                    self.joint_pos,
+                    joint_vel,
+                    self.root_pos_w,
+                    root_rot6d,
+                    root_vel_w,
+                    self.object_pos_w,
+                    object_rot6d,
+                    object_vel_w,
+                ],
+                dim=-1,
+            )
+        return chunk
 
     def _build_motion_slices(self, raw_list: list[Any]) -> tuple[list[slice], list[int]]:
         lengths: list[int] = []

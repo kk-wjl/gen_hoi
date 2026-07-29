@@ -19,7 +19,8 @@ from tqdm import tqdm
 from cfg import Config, parse_args
 from dataset import MotionLoader
 from flow import LinearFlow
-from model import DiffusionTransformer1D
+from models.dit import DiffusionTransformer1D
+from models.unet import ConditionalUNet1D
 from utils.checkpoint import load_training_checkpoint, save_training_checkpoint
 from utils.optim import MuonAdamWWrapper
 
@@ -60,6 +61,31 @@ def build_optimizer(config: Config, model: torch.nn.Module) -> torch.optim.Optim
         lr=config.optim.lr,
         weight_decay=config.optim.weight_decay,
     )
+
+
+def build_model(config: Config, feature_dim: int) -> torch.nn.Module:
+    if config.model.use_dit:
+        model = DiffusionTransformer1D(
+            input_dim=feature_dim,
+            output_dim=feature_dim,
+            hidden_size=config.model.hidden_size,
+            depth=config.model.depth,
+            num_heads=config.model.num_heads,
+            mlp_ratio=config.model.mlp_ratio,
+            max_seq_len=config.model.max_seq_len,
+            dropout=config.model.dropout,
+        )
+    else:
+        model = ConditionalUNet1D(
+            input_dim=feature_dim,
+            output_dim=feature_dim,
+            base_channels=config.model.base_channels,
+            channel_mults=tuple(config.model.channel_mults),
+            cond_dim=config.model.cond_dim,
+            dropout=config.model.dropout,
+        )
+    model.sample_shape = (config.dataset.seq_len, feature_dim)
+    return model
 
 
 def compute_metrics(
@@ -133,6 +159,7 @@ def main() -> None:
         stride=config.dataset.stride,
         make_relative=config.dataset.make_relative,
         normalize=config.dataset.normalize,
+        use_vel=config.dataset.use_vel,
         use_stats_cache=config.dataset.use_stats_cache,
     )
     dataloader = DataLoader(
@@ -144,17 +171,7 @@ def main() -> None:
         drop_last=False,
     )
 
-    model = DiffusionTransformer1D(
-        input_dim=dataset.feature_dim,
-        output_dim=dataset.feature_dim,
-        hidden_size=config.model.hidden_size,
-        depth=config.model.depth,
-        num_heads=config.model.num_heads,
-        mlp_ratio=config.model.mlp_ratio,
-        max_seq_len=config.model.max_seq_len,
-        dropout=config.model.dropout,
-    )
-    model.sample_shape = (config.dataset.seq_len, dataset.feature_dim)
+    model = build_model(config, dataset.feature_dim)
     model.to(device)
     num_parameters = sum(param.numel() for param in model.parameters())
     trainable_parameters = sum(param.numel() for param in model.parameters() if param.requires_grad)

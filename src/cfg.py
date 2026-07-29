@@ -12,17 +12,24 @@ class DatasetConfig:
     stride: int = 1
     make_relative: bool = True
     normalize: bool = True
+    use_vel: bool = True
     use_stats_cache: bool = True
 
 
 @dataclass
 class ModelConfig:
+    use_dit: bool = True
+    # dit config
     hidden_size: int = 512
     depth: int = 12
     num_heads: int = 8
     mlp_ratio: float = 4.0
     dropout: float = 0.0
     max_seq_len: int = 256
+    # unet config
+    base_channels: int = 128
+    channel_mults: tuple[int, ...] = (1, 2, 4, 8)
+    cond_dim: int = 256
 
 
 @dataclass
@@ -110,12 +117,16 @@ def parse_args() -> Config:
     parser.add_argument("--seed", type=int, default=TrainConfig.seed)
     parser.add_argument("--device", default=TrainConfig.device)
 
+    parser.add_argument("--use-dit", action=argparse.BooleanOptionalAction, default=ModelConfig.use_dit)
     parser.add_argument("--hidden-size", type=int, default=ModelConfig.hidden_size)
     parser.add_argument("--depth", type=int, default=ModelConfig.depth)
     parser.add_argument("--num-heads", type=int, default=ModelConfig.num_heads)
     parser.add_argument("--mlp-ratio", type=float, default=ModelConfig.mlp_ratio)
     parser.add_argument("--dropout", type=float, default=ModelConfig.dropout)
     parser.add_argument("--max-seq-len", type=int, default=ModelConfig.max_seq_len)
+    parser.add_argument("--base-channels", type=int, default=ModelConfig.base_channels)
+    parser.add_argument("--channel-mults", type=int, nargs="+", default=list(ModelConfig.channel_mults))
+    parser.add_argument("--cond-dim", type=int, default=ModelConfig.cond_dim)
 
     parser.add_argument("--optimizer", choices=["adamw", "muon_adamw"], default=OptimConfig.name)
     parser.add_argument("--lr", type=float, default=OptimConfig.lr)
@@ -143,12 +154,16 @@ def parse_args() -> Config:
             stride=args.stride,
         ),
         model=ModelConfig(
+            use_dit=args.use_dit,
             hidden_size=args.hidden_size,
             depth=args.depth,
             num_heads=args.num_heads,
             mlp_ratio=args.mlp_ratio,
             dropout=args.dropout,
             max_seq_len=args.max_seq_len,
+            base_channels=args.base_channels,
+            channel_mults=tuple(args.channel_mults),
+            cond_dim=args.cond_dim,
         ),
         optim=OptimConfig(
             name=args.optimizer,

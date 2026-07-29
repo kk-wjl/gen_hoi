@@ -2,6 +2,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -14,7 +15,8 @@ import torch
 from cfg import Config, config_from_dict
 from dataset import MotionLoader
 from flow import LinearFlow
-from model import DiffusionTransformer1D
+from models.dit import DiffusionTransformer1D
+from models.unet import ConditionalUNet1D
 from utils.checkpoint import read_training_checkpoint_config
 
 
@@ -35,23 +37,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None, help="Override device. Defaults to the checkpoint config value.")
     return parser.parse_args()
 
+
+def load_run_config(run_dir: Path, checkpoint_path: Path) -> Config:
+    config_path = run_dir / "logs" / "config.json"
+    if config_path.is_file():
+        config_dict: dict[str, Any] = json.loads(config_path.read_text(encoding="utf-8"))
+    else:
+        config_dict = read_training_checkpoint_config(checkpoint_path, map_location="cpu")
+    return config_from_dict(config_dict)
+
+def build_model(config: Config, feature_dim: int) -> torch.nn.Module:
+    if config.model.use_dit:
+        model = DiffusionTransformer1D(
+            input_dim=feature_dim,
+            output_dim=feature_dim,
+            hidden_size=config.model.hidden_size,
+            depth=config.model.depth,
+            num_heads=config.model.num_heads,
+            mlp_ratio=config.model.mlp_ratio,
+            max_seq_len=config.model.max_seq_len,
+            dropout=config.model.dropout,
+        )
+    else:
+        model = ConditionalUNet1D(
+            input_dim=feature_dim,
+            output_dim=feature_dim,
+            base_channels=config.model.base_channels,
+            channel_mults=tuple(config.model.channel_mults),
+            cond_dim=config.model.cond_dim,
+            dropout=config.model.dropout,
+        )
+    model.sample_shape = (config.dataset.seq_len, feature_dim)
+    return model
+
+
 def load_checkpoint_model(
     checkpoint_path: Path,
     config: Config,
     dataset: MotionLoader,
-) -> tuple[DiffusionTransformer1D, LinearFlow, int]:
+) -> tuple[torch.nn.Module, LinearFlow, int]:
     device = torch.device(config.train.device)
-    model = DiffusionTransformer1D(
-        input_dim=dataset.feature_dim,
-        output_dim=dataset.feature_dim,
-        hidden_size=config.model.hidden_size,
-        depth=config.model.depth,
-        num_heads=config.model.num_heads,
-        mlp_ratio=config.model.mlp_ratio,
-        max_seq_len=config.model.max_seq_len,
-        dropout=config.model.dropout,
-    )
-    model.sample_shape = (config.dataset.seq_len, dataset.feature_dim)
+    model = build_model(config, dataset.feature_dim)
     model.to(device)
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(payload["model_state_dict"])
@@ -76,16 +102,27 @@ def choose_indices(dataset_len: int, num_rollouts: int, seed: int) -> list[int]:
     return [int(index) for index in indices.tolist()]
 
 
-def save_rollout_npz(path: Path, pose: dict[str, torch.Tensor], fps: float) -> None:
+def save_rollout_npz(
+    path: Path,
+    pose: dict[str, torch.Tensor],
+    fps: float,
+    *,
+    joint_vel: torch.Tensor | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "joint_pos": pose["joint_pos"].cpu().numpy(),
+        "root_pos": pose["root_pos"].cpu().numpy(),
+        "root_quat": pose["root_quat"].cpu().numpy(),
+        "object_pos": pose["object_pos"].cpu().numpy(),
+        "object_quat": pose["object_quat"].cpu().numpy(),
+        "fps": np.asarray([fps], dtype=np.float32),
+    }
+    if joint_vel is not None:
+        payload["joint_vel"] = joint_vel.cpu().numpy()
     np.savez_compressed(
         path,
-        joint_pos=pose["joint_pos"].cpu().numpy(),
-        root_pos=pose["root_pos"].cpu().numpy(),
-        root_quat=pose["root_quat"].cpu().numpy(),
-        object_pos=pose["object_pos"].cpu().numpy(),
-        object_quat=pose["object_quat"].cpu().numpy(),
-        fps=np.asarray([fps], dtype=np.float32),
+        **payload,
     )
 
 
@@ -164,8 +201,7 @@ def main() -> None:
         else run_dir / "validate"
     )
 
-    config_dict = read_training_checkpoint_config(checkpoint_path, map_location="cpu")
-    config = config_from_dict(config_dict)
+    config = load_run_config(run_dir, checkpoint_path)
     if args.device is not None:
         config.train.device = args.device
     device = torch.device(config.train.device)
@@ -188,6 +224,7 @@ def main() -> None:
         stride=config.dataset.stride,
         make_relative=config.dataset.make_relative,
         normalize=config.dataset.normalize,
+        use_vel=config.dataset.use_vel,
         use_stats_cache=config.dataset.use_stats_cache,
     )
     _, flow, checkpoint_epoch = load_checkpoint_model(checkpoint_path, config, dataset)
@@ -196,6 +233,12 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "rollout_metrics.jsonl"
     rollout_poses: list[dict[str, torch.Tensor]] = []
+    rollout_joint_vels: list[torch.Tensor] = []
+    metric_sums = {
+        "root_vel_fd_mse": 0.0,
+        "joint_vel_fd_mse": 0.0,
+        "object_vel_fd_mse": 0.0,
+    }
 
     with metrics_path.open("w", encoding="utf-8") as metrics_file:
         for rollout_id, dataset_index in enumerate(indices):
@@ -216,12 +259,14 @@ def main() -> None:
                 device=device,
             )
             pred_pose = dataset.chunk_to_pose(pred_world_chunk)
+            pred_joint_vel = pred_world_chunk[..., dataset.joint_vel_slice]
             metrics = dataset.metrics(pred_world_chunk, normalized=False)
 
             rollout_name = f"rollout_{rollout_id:03d}.npz"
             rollout_path = output_dir / rollout_name
-            save_rollout_npz(rollout_path, pred_pose, dataset.fps)
+            save_rollout_npz(rollout_path, pred_pose, dataset.fps, joint_vel=pred_joint_vel)
             rollout_poses.append(pred_pose)
+            rollout_joint_vels.append(pred_joint_vel)
 
             record = {
                 "rollout_id": rollout_id,
@@ -244,7 +289,30 @@ def main() -> None:
             metrics_file.write(json.dumps(record, ensure_ascii=True) + "\n")
             print(json.dumps(record, ensure_ascii=True, indent=2))
 
-    save_rollout_npz(output_dir / "rollout.npz", cat_rollout_poses(rollout_poses), dataset.fps)
+            for key in metric_sums:
+                metric_sums[key] += record[key]
+
+        mean_record = {
+            "record_type": "summary",
+            "num_rollouts": len(indices),
+            "cond_steps": cond_steps,
+            "num_steps": args.num_steps,
+            "num_windows": args.num_windows,
+            "seed": args.seed,
+            "checkpoint_path": str(checkpoint_path),
+            "mean_root_vel_fd_mse": metric_sums["root_vel_fd_mse"] / len(indices),
+            "mean_joint_vel_fd_mse": metric_sums["joint_vel_fd_mse"] / len(indices),
+            "mean_object_vel_fd_mse": metric_sums["object_vel_fd_mse"] / len(indices),
+        }
+        metrics_file.write(json.dumps(mean_record, ensure_ascii=True) + "\n")
+        print(json.dumps(mean_record, ensure_ascii=True, indent=2))
+
+    save_rollout_npz(
+        output_dir / "rollout.npz",
+        cat_rollout_poses(rollout_poses),
+        dataset.fps,
+        joint_vel=torch.cat(rollout_joint_vels, dim=0),
+    )
 
 
 if __name__ == "__main__":
