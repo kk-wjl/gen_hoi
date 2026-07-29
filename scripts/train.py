@@ -2,9 +2,11 @@ import json
 import random
 import sys
 import time
+from datetime import datetime
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+import setproctitle
 
 import numpy as np
 
@@ -61,6 +63,23 @@ def build_optimizer(config: Config, model: torch.nn.Module) -> torch.optim.Optim
         lr=config.optim.lr,
         weight_decay=config.optim.weight_decay,
     )
+
+
+def update_process_title(
+    *,
+    run_name: str,
+    train_start_time: float,
+    completed_steps: int,
+    total_steps: int,
+) -> None:
+    if completed_steps <= 0 or total_steps <= 0:
+        return
+    elapsed = max(time.perf_counter() - train_start_time, 0.0)
+    seconds_per_step = elapsed / completed_steps
+    remaining_steps = max(total_steps - completed_steps, 0)
+    end_timestamp = time.time() + seconds_per_step * remaining_steps
+    end_text = datetime.fromtimestamp(end_timestamp).strftime("%Y-%m-%d %H:%M")
+    setproctitle.setproctitle(f"gen_hoi {run_name} end<={end_text}")
 
 
 def build_model(config: Config, feature_dim: int) -> torch.nn.Module:
@@ -225,6 +244,8 @@ def main() -> None:
     start_epoch = 0
     latest_ckpt = checkpoint_dir / "latest.pt"
     train_start_time = time.perf_counter()
+    total_steps = config.train.epochs * len(dataloader)
+    completed_steps = 0
     peak_gpu_memory_allocated_mb = 0.0
     peak_gpu_memory_reserved_mb = 0.0
     previous_total_time_sec = 0.0
@@ -251,6 +272,8 @@ def main() -> None:
     elif latest_ckpt.is_file():
         start_epoch = load_training_checkpoint(latest_ckpt, model, optimizer, map_location=device)
         print(f"Auto-resumed from {latest_ckpt} at epoch {start_epoch}")
+    completed_steps = start_epoch * len(dataloader)
+    setproctitle.setproctitle(f"gen_hoi {run_name} end<=unknown")
     config_path.write_text(json.dumps(run_config, ensure_ascii=True, indent=2), encoding="utf-8")
 
     for epoch in range(start_epoch, config.train.epochs):
@@ -279,8 +302,15 @@ def main() -> None:
             grad_norm_value = float(grad_norm)
             epoch_losses.append(loss_value)
             epoch_grad_norms.append(grad_norm_value)
+            completed_steps += 1
 
             if step % config.train.log_every == 0 or step == len(dataloader):
+                update_process_title(
+                    run_name=run_name,
+                    train_start_time=train_start_time,
+                    completed_steps=completed_steps,
+                    total_steps=total_steps,
+                )
                 progress.set_postfix(
                     loss=f"{loss_value:.5f}",
                 )
@@ -337,6 +367,7 @@ def main() -> None:
             )
 
     run_config["total_time_sec"] = time.perf_counter() - train_start_time + previous_total_time_sec
+    setproctitle.setproctitle(f"gen_hoi {run_name} end<=done")
     if device.type == "cuda":
         run_config["peak_gpu_memory_allocated_mb"] = peak_gpu_memory_allocated_mb
         run_config["peak_gpu_memory_reserved_mb"] = peak_gpu_memory_reserved_mb

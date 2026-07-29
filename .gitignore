@@ -6,8 +6,9 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
+# Virtual environments and data
 .venv
 data/
-vis/
-test/
+vis/data/
+vis/assets
+
