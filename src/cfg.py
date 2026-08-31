@@ -12,7 +12,7 @@ class DatasetConfig:
     stride: int = 1
     make_relative: bool = True
     normalize: bool = True
-    use_vel: bool = True
+    use_vel: bool = False
     use_stats_cache: bool = True
 
 
@@ -20,8 +20,8 @@ class DatasetConfig:
 class ModelConfig:
     use_dit: bool = True
     # dit config
-    hidden_size: int = 512
-    depth: int = 12
+    hidden_size: int = 256
+    depth: int = 8
     num_heads: int = 8
     mlp_ratio: float = 4.0
     dropout: float = 0.0
@@ -35,7 +35,7 @@ class ModelConfig:
 @dataclass
 class OptimConfig:
     name: str = "adamw"
-    lr: float = 1e-4
+    lr: float = 3e-4
     weight_decay: float = 1e-2
     grad_clip_norm: float = 1.0
 
@@ -43,13 +43,13 @@ class OptimConfig:
 @dataclass
 class FlowConfig:
     noise_scale: float = 1.0
-    t_eps: float = 1e-5
+    t_eps: float = 1e-2
 
 
 @dataclass
 class TrainConfig:
     batch_size: int = 64
-    epochs: int = 80
+    epochs: int = 100
     num_workers: int = 0
     seed: int = 42
     device: str = "cuda"
@@ -61,12 +61,12 @@ class TrainConfig:
 @dataclass
 class OutputConfig:
     root_dir: str = "outputs"
-    run_name: str = "Baseline"
+    run_name: str = "Baseline_v_pred_flow"
 
 
 @dataclass
 class WandbConfig:
-    enabled: bool = True
+    enabled: bool = False
     project: str = "gen-hoi"
     entity: str | None = None
     name: str = ""

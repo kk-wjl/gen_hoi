@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from typing import cast
 
 
 class LinearFlow(nn.Module):
@@ -52,6 +53,7 @@ class LinearFlow(nn.Module):
                     f"cond_steps must be in [1, T], got cond_steps={cond_steps}, T={x1.shape[1]}"
                 )
             x0[:, :cond_steps] = x1[:, :cond_steps]
+        target_velocity = x1 - x0
         xt = (1 - t_expand) * x0 + t_expand * x1
         if cond_steps is not None:
             xt[:, :cond_steps] = x1[:, :cond_steps]
@@ -63,7 +65,7 @@ class LinearFlow(nn.Module):
         else:
             pred = self.model(xt, t)
 
-        err = (pred - x1) ** 2
+        err = (pred - target_velocity) ** 2
         if cond_steps is None:
             return err.mean()
         return err[:, cond_steps:, :].mean()
@@ -82,20 +84,23 @@ class LinearFlow(nn.Module):
             raise ValueError(f"num_steps must be >= 1, got {num_steps}")
 
         dtype = next(self.model.parameters()).dtype
-        seq_len = int(self.sample_shape[0])
+        sample_shape = cast(tuple[int, ...], self.sample_shape)
+        seq_len = int(sample_shape[0])
         n, _, d = cond_prefix.shape
         k = cond_prefix.shape[1]
         cond_prefix = cond_prefix.to(device=device, dtype=dtype)
         x_t = torch.randn(n, seq_len, d, device=device, dtype=dtype) * self.noise_scale
         x_t[:, :k] = cond_prefix
 
-        dt = (1.0 - self.t_eps) / num_steps
-        for step in range(num_steps):
-            t_value = step * dt
-            t = torch.full((n,), t_value, device=device, dtype=dtype)
-            pred_x1 = self.model(x_t, t)
-            denom = (1.0 - t).reshape((-1,) + (x_t.ndim - 1) * (1,)).clamp_min(self.t_eps)
-            velocity = (pred_x1 - x_t) / denom
+        ts = torch.linspace(self.t_eps, 1.0 - self.t_eps, num_steps, device=device, dtype=dtype)
+        dt = (
+            ts[1] - ts[0]
+            if num_steps > 1
+            else torch.tensor(1.0 - 2 * self.t_eps, device=device, dtype=dtype)
+        )
+        for t_scalar in ts:
+            t = torch.full((n,), t_scalar.item(), device=device, dtype=dtype)
+            velocity = self.model(x_t, t)
             x_t = x_t + dt * velocity
             x_t[:, :k] = cond_prefix
         return x_t
@@ -116,7 +121,8 @@ class LinearFlow(nn.Module):
             raise ValueError(f"num_steps must be >= 1, got {num_steps}")
 
         dtype = next(self.model.parameters()).dtype
-        seq_len = int(self.sample_shape[0])
+        sample_shape = cast(tuple[int, ...], self.sample_shape)
+        seq_len = int(sample_shape[0])
         n, _, d = cond_prefix.shape
         k = cond_prefix.shape[1]
         cond_prefix = cond_prefix.to(device=device, dtype=dtype)
@@ -128,15 +134,16 @@ class LinearFlow(nn.Module):
         x_t[:, :k] = cond_prefix
         y_null = torch.zeros_like(y)
 
-        dt = (1.0 - self.t_eps) / num_steps
-        for step in range(num_steps):
-            t_value = step * dt
-            t = torch.full((n,), t_value, device=device, dtype=dtype)
-            pred_x1_uncond = self.model(x_t, t, y_null)
-            pred_x1_cond = self.model(x_t, t, y)
-            denom = (1.0 - t).reshape((-1,) + (x_t.ndim - 1) * (1,)).clamp_min(self.t_eps)
-            v_uncond = (pred_x1_uncond - x_t) / denom
-            v_cond = (pred_x1_cond - x_t) / denom
+        ts = torch.linspace(self.t_eps, 1.0 - self.t_eps, num_steps, device=device, dtype=dtype)
+        dt = (
+            ts[1] - ts[0]
+            if num_steps > 1
+            else torch.tensor(1.0 - 2 * self.t_eps, device=device, dtype=dtype)
+        )
+        for t_scalar in ts:
+            t = torch.full((n,), t_scalar.item(), device=device, dtype=dtype)
+            v_uncond = self.model(x_t, t, y_null)
+            v_cond = self.model(x_t, t, y)
             velocity = v_uncond + cond_scale * (v_cond - v_uncond)
             x_t = x_t + dt * velocity
             x_t[:, :k] = cond_prefix

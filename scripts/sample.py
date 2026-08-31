@@ -30,10 +30,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default=None, help="Output directory. Defaults to <run-dir>/validate")
     parser.add_argument("--num-rollouts", type=int, default=6)
-    parser.add_argument("--num-steps", type=int, default=50)
+    parser.add_argument("--num-steps", type=int, default=80)
     parser.add_argument("--cond-steps", type=int, default=None)
-    parser.add_argument("--num-windows", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-windows", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=45)
     parser.add_argument("--device", default=None, help="Override device. Defaults to the checkpoint config value.")
     return parser.parse_args()
 
