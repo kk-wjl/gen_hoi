@@ -6,8 +6,8 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SOURCE_PATH = REPO_ROOT / "data" / "smalltable.npz"
-TARGET_PATH = REPO_ROOT / "vis" / "data" / "smalltable_vis.npz"
+SOURCE_PATH = REPO_ROOT / "data" / "contact" / "train_retargeted_smalltable_replay_policy_success.npz"
+TARGET_PATH = REPO_ROOT / "vis" / "data" / "processed" / "train_retargeted_smalltable_replay_policy_success_vis.npz"
 
 
 if __name__ == "__main__":
@@ -22,10 +22,10 @@ if __name__ == "__main__":
     
     converted = {
         "joint_pos": joint_pos,
-        "root_pos": body_pos_w[:, 0, :],
-        "root_quat": body_quat_w[:, 0, :],
-        "object_pos": object_pos_w,
-        "object_quat": object_quat_w,
+        "root_pos_w": body_pos_w[:, 0, :],
+        "root_quat_w": body_quat_w[:, 0, :],
+        "object_pos_w": object_pos_w,
+        "object_quat_w": object_quat_w,
         "fps": fps,
     }
 

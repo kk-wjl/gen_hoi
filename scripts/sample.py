@@ -112,10 +112,10 @@ def save_rollout_npz(
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "joint_pos": pose["joint_pos"].cpu().numpy(),
-        "root_pos": pose["root_pos"].cpu().numpy(),
-        "root_quat": pose["root_quat"].cpu().numpy(),
-        "object_pos": pose["object_pos"].cpu().numpy(),
-        "object_quat": pose["object_quat"].cpu().numpy(),
+        "root_pos_w": pose["root_pos"].cpu().numpy(),
+        "root_quat_w": pose["root_quat"].cpu().numpy(),
+        "object_pos_w": pose["object_pos"].cpu().numpy(),
+        "object_quat_w": pose["object_quat"].cpu().numpy(),
         "fps": np.asarray([fps], dtype=np.float32),
     }
     if joint_vel is not None:
@@ -238,6 +238,8 @@ def main() -> None:
         "root_vel_fd_mse": 0.0,
         "joint_vel_fd_mse": 0.0,
         "object_vel_fd_mse": 0.0,
+        "root_ang_vel_fd_mse": 0.0,
+        "object_ang_vel_fd_mse": 0.0,
     }
 
     with metrics_path.open("w", encoding="utf-8") as metrics_file:
@@ -285,6 +287,8 @@ def main() -> None:
                 "root_vel_fd_mse": metrics["root_vel_fd_mse"],
                 "joint_vel_fd_mse": metrics["joint_vel_fd_mse"],
                 "object_vel_fd_mse": metrics["object_vel_fd_mse"],
+                "root_ang_vel_fd_mse": metrics["root_ang_vel_fd_mse"],
+                "object_ang_vel_fd_mse": metrics["object_ang_vel_fd_mse"],
             }
             metrics_file.write(json.dumps(record, ensure_ascii=True) + "\n")
             print(json.dumps(record, ensure_ascii=True, indent=2))
@@ -303,6 +307,8 @@ def main() -> None:
             "mean_root_vel_fd_mse": metric_sums["root_vel_fd_mse"] / len(indices),
             "mean_joint_vel_fd_mse": metric_sums["joint_vel_fd_mse"] / len(indices),
             "mean_object_vel_fd_mse": metric_sums["object_vel_fd_mse"] / len(indices),
+            "mean_root_ang_vel_fd_mse": metric_sums["root_ang_vel_fd_mse"] / len(indices),
+            "mean_object_ang_vel_fd_mse": metric_sums["object_ang_vel_fd_mse"] / len(indices),
         }
         metrics_file.write(json.dumps(mean_record, ensure_ascii=True) + "\n")
         print(json.dumps(mean_record, ensure_ascii=True, indent=2))

@@ -121,6 +121,8 @@ def compute_metrics(
         "root_vel_fd_mse": 0.0,
         "joint_vel_fd_mse": 0.0,
         "object_vel_fd_mse": 0.0,
+        "root_ang_vel_fd_mse": 0.0,
+        "object_ang_vel_fd_mse": 0.0,
     }
     eval_rng = np.random.default_rng(seed)
     eval_indices = [
@@ -326,7 +328,7 @@ def main() -> None:
                 seed=config.train.seed,
                 eval_count=6,
                 cond_steps=config.train.cond_steps,
-                num_steps=50,
+                num_steps=80,
                 device=device,
             )
         }

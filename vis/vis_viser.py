@@ -13,7 +13,7 @@ import viser
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MOTION_PATH = REPO_ROOT / "vis" / "data" / "rollout.npz"
+DEFAULT_MOTION_PATH = REPO_ROOT / "vis" / "data" / "processed" / "smalltable_g1_replay_policy_success_vis.npz"
 DEFAULT_URDF_PATH = REPO_ROOT / "vis" / "assets" / "unitree_g1" / "g1_29dof_rev_1_0_with_inspire_hand_DFQ.urdf"
 DEFAULT_OBJECT_MESH_PATH = REPO_ROOT / "vis" / "assets" / "smalltable.stl"
 DEFAULT_HOST = "127.0.0.1"
@@ -184,19 +184,19 @@ def load_motion(npz_path: Path) -> dict[str, np.ndarray]:
     data = np.load(npz_path)
     motion = {
         "joint_pos": np.asarray(data["joint_pos"], dtype=np.float32),
-        "root_pos": np.asarray(data["root_pos"], dtype=np.float32),
-        "root_quat": normalize_wxyz(data["root_quat"]),
-        "object_pos": np.asarray(data["object_pos"], dtype=np.float32),
-        "object_quat": normalize_wxyz(data["object_quat"]),
+        "root_pos_w": np.asarray(data["root_pos_w"], dtype=np.float32),
+        "root_quat_w": normalize_wxyz(data["root_quat_w"]),
+        "object_pos_w": np.asarray(data["object_pos_w"], dtype=np.float32),
+        "object_quat_w": normalize_wxyz(data["object_quat_w"]),
         "fps": np.asarray(data["fps"], dtype=np.float32),
     }
 
     num_frames = motion["joint_pos"].shape[0]
     expected_shapes = {
-        "root_pos": (num_frames, 3),
-        "root_quat": (num_frames, 4),
-        "object_pos": (num_frames, 3),
-        "object_quat": (num_frames, 4),
+        "root_pos_w": (num_frames, 3),
+        "root_quat_w": (num_frames, 4),
+        "object_pos_w": (num_frames, 3),
+        "object_quat_w": (num_frames, 4),
     }
     for key, expected_shape in expected_shapes.items():
         if motion[key].shape != expected_shape:
@@ -343,8 +343,8 @@ class MotionViewer:
         q = build_configuration(
             self.model,
             self.joint_q_indices,
-            self.motion["root_pos"][frame_idx],
-            self.motion["root_quat"][frame_idx],
+            self.motion["root_pos_w"][frame_idx],
+            self.motion["root_quat_w"][frame_idx],
             self.motion["joint_pos"][frame_idx],
         )
         pin.forwardKinematics(self.model, self.data, q)
@@ -357,8 +357,8 @@ class MotionViewer:
             handle.position = placement.translation.astype(np.float32)
             handle.wxyz = rotmat_to_wxyz(placement.rotation)
 
-        self.object_handle.position = self.motion["object_pos"][frame_idx]
-        self.object_handle.wxyz = self.motion["object_quat"][frame_idx]
+        self.object_handle.position = self.motion["object_pos_w"][frame_idx]
+        self.object_handle.wxyz = self.motion["object_quat_w"][frame_idx]
 
     def run(self) -> None:
         while True:

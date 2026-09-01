@@ -104,18 +104,18 @@ def load_motion(npz_path: Path) -> dict[str, np.ndarray]:
     data = np.load(npz_path)
     motion = {
         "joint_pos": np.asarray(data["joint_pos"], dtype=np.float64),
-        "root_pos": np.asarray(data["root_pos"], dtype=np.float64),
-        "root_quat": np.asarray(data["root_quat"], dtype=np.float64),
-        "object_pos": np.asarray(data["object_pos"], dtype=np.float64),
-        "object_quat": np.asarray(data["object_quat"], dtype=np.float64),
+        "root_pos_w": np.asarray(data["root_pos_w"], dtype=np.float64),
+        "root_quat_w": np.asarray(data["root_quat_w"], dtype=np.float64),
+        "object_pos_w": np.asarray(data["object_pos_w"], dtype=np.float64),
+        "object_quat_w": np.asarray(data["object_quat_w"], dtype=np.float64),
         "fps": float(np.asarray(data["fps"]).reshape(-1)[0]),
     }
     num_frames = motion["joint_pos"].shape[0]
     expected_shapes = {
-        "root_pos": (num_frames, 3),
-        "root_quat": (num_frames, 4),
-        "object_pos": (num_frames, 3),
-        "object_quat": (num_frames, 4),
+        "root_pos_w": (num_frames, 3),
+        "root_quat_w": (num_frames, 4),
+        "object_pos_w": (num_frames, 3),
+        "object_quat_w": (num_frames, 4),
     }
     for key, expected in expected_shapes.items():
         if motion[key].shape != expected:
@@ -146,12 +146,12 @@ def apply_frame(
     joint_qposadr: np.ndarray,
     object_mocap_id: int,
 ) -> None:
-    data.qpos[root_qposadr : root_qposadr + 3] = motion["root_pos"][frame_idx]
-    data.qpos[root_qposadr + 3 : root_qposadr + 7] = motion["root_quat"][frame_idx]
+    data.qpos[root_qposadr : root_qposadr + 3] = motion["root_pos_w"][frame_idx]
+    data.qpos[root_qposadr + 3 : root_qposadr + 7] = motion["root_quat_w"][frame_idx]
     data.qpos[joint_qposadr] = motion["joint_pos"][frame_idx]
 
-    data.mocap_pos[object_mocap_id] = motion["object_pos"][frame_idx]
-    data.mocap_quat[object_mocap_id] = motion["object_quat"][frame_idx]
+    data.mocap_pos[object_mocap_id] = motion["object_pos_w"][frame_idx]
+    data.mocap_quat[object_mocap_id] = motion["object_quat_w"][frame_idx]
     mujoco.mj_forward(model, data)
 
 

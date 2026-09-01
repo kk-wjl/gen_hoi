@@ -9,6 +9,7 @@ wheels/
 # Virtual environments and data
 .venv
 data/
-vis/data/
-vis/assets
-
+tests/
+vis/assets/
+src/assets/
+src/objects/

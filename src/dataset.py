@@ -30,6 +30,8 @@ import torch
 from torch.utils.data import Dataset
 
 from utils.math import (
+    quat_conjugate,
+    quat_mul,
     quat_normalize_wxyz,
     quat_to_rot6d,
     quat_standardize_wxyz,
@@ -46,8 +48,10 @@ JOINT_POS_DIM = 53
 JOINT_VEL_DIM = 53
 ROOT_POS_DIM = 3
 ROOT_LIN_VEL_DIM = 3
+ROOT_ANG_VEL_DIM = 3
 OBJECT_POS_DIM = 3
 OBJECT_LIN_VEL_DIM = 3
+OBJECT_ANG_VEL_DIM = 3
 ROT6D_DIM = 6
 
 JOINT_POS_START = 0
@@ -58,15 +62,19 @@ ROOT_POS_START = JOINT_VEL_END
 ROOT_POS_END = ROOT_POS_START + ROOT_POS_DIM
 ROOT_ROT6D_START = ROOT_POS_END
 ROOT_ROT6D_END = ROOT_ROT6D_START + ROT6D_DIM
-ROOT_VEL_START = ROOT_ROT6D_END
-ROOT_VEL_END = ROOT_VEL_START + ROOT_LIN_VEL_DIM
-OBJECT_POS_START = ROOT_VEL_END
+ROOT_LIN_VEL_START = ROOT_ROT6D_END
+ROOT_LIN_VEL_END = ROOT_LIN_VEL_START + ROOT_LIN_VEL_DIM
+ROOT_ANG_VEL_START = ROOT_LIN_VEL_END
+ROOT_ANG_VEL_END = ROOT_ANG_VEL_START + ROOT_ANG_VEL_DIM
+OBJECT_POS_START = ROOT_ANG_VEL_END
 OBJECT_POS_END = OBJECT_POS_START + OBJECT_POS_DIM
 OBJECT_ROT6D_START = OBJECT_POS_END
 OBJECT_ROT6D_END = OBJECT_ROT6D_START + ROT6D_DIM
-OBJECT_VEL_START = OBJECT_ROT6D_END
-OBJECT_VEL_END = OBJECT_VEL_START + OBJECT_LIN_VEL_DIM
-FEATURE_DIM = OBJECT_VEL_END
+OBJECT_LIN_VEL_START = OBJECT_ROT6D_END
+OBJECT_LIN_VEL_END = OBJECT_LIN_VEL_START + OBJECT_LIN_VEL_DIM
+OBJECT_ANG_VEL_START = OBJECT_LIN_VEL_END
+OBJECT_ANG_VEL_END = OBJECT_ANG_VEL_START + OBJECT_ANG_VEL_DIM
+FEATURE_DIM = OBJECT_ANG_VEL_END
 MOTION_STATS_CACHE_VERSION = 1
 
 
@@ -179,7 +187,7 @@ class MotionLoader(Dataset):
     Sliding-window dataset over HOI motion ``npz`` files.
 
     Unified per-frame state layout:
-    ``[joint_pos, joint_vel, root_pos, root_rot6d, root_vel, object_pos, object_rot6d, object_vel]``
+    ``[joint_pos, joint_vel, root_pos, root_rot6d, root_lin_vel, root_ang_vel, object_pos, object_rot6d, object_lin_vel, object_ang_vel]``
 
     A helper is provided to extract:
     ``[joint_pos, root_pos, root_quat_wxyz, object_pos, object_quat_wxyz]``
@@ -236,8 +244,12 @@ class MotionLoader(Dataset):
                 )
             )
         )
-        self.root_vel_w = torch.cat(
+        self.root_lin_vel_w = torch.cat(
             [torch.as_tensor(raw["body_lin_vel_w"][:, 0, :], dtype=dtype) for raw in raw_list],
+            dim=0,
+        )
+        self.root_ang_vel_w = torch.cat(
+            [torch.as_tensor(raw["body_ang_vel_w"][:, 0, :], dtype=dtype) for raw in raw_list],
             dim=0,
         )
         self.object_pos_w = torch.cat(
@@ -252,8 +264,12 @@ class MotionLoader(Dataset):
                 )
             )
         )
-        self.object_vel_w = torch.cat(
+        self.object_lin_vel_w = torch.cat(
             [torch.as_tensor(raw["object_lin_vel_w"], dtype=dtype) for raw in raw_list],
+            dim=0,
+        )
+        self.object_ang_vel_w = torch.cat(
+            [torch.as_tensor(raw["object_ang_vel_w"], dtype=dtype) for raw in raw_list],
             dim=0,
         )
 
@@ -264,10 +280,12 @@ class MotionLoader(Dataset):
         self.joint_vel_slice = slice(JOINT_VEL_START, JOINT_VEL_END)
         self.root_pos_slice = slice(ROOT_POS_START, ROOT_POS_END)
         self.root_rot6d_slice = slice(ROOT_ROT6D_START, ROOT_ROT6D_END)
-        self.root_vel_slice = slice(ROOT_VEL_START, ROOT_VEL_END)
+        self.root_lin_vel_slice = slice(ROOT_LIN_VEL_START, ROOT_LIN_VEL_END)
+        self.root_ang_vel_slice = slice(ROOT_ANG_VEL_START, ROOT_ANG_VEL_END)
         self.object_pos_slice = slice(OBJECT_POS_START, OBJECT_POS_END)
         self.object_rot6d_slice = slice(OBJECT_ROT6D_START, OBJECT_ROT6D_END)
-        self.object_vel_slice = slice(OBJECT_VEL_START, OBJECT_VEL_END)
+        self.object_lin_vel_slice = slice(OBJECT_LIN_VEL_START, OBJECT_LIN_VEL_END)
+        self.object_ang_vel_slice = slice(OBJECT_ANG_VEL_START, OBJECT_ANG_VEL_END)
         self.feature_dim = FEATURE_DIM
 
         self.state_frames = self._build_state_frames()
@@ -290,27 +308,57 @@ class MotionLoader(Dataset):
                 vel[motion_slice][1:] = motion_vel
         return vel
 
+    def _quat_to_vel(self, quat: torch.Tensor) -> torch.Tensor:
+        ang_vel = torch.zeros(quat.shape[:-1] + (3,), dtype=quat.dtype, device=quat.device)
+        for motion_slice in self.motion_slices:
+            motion_quat = quat_standardize_wxyz(quat_normalize_wxyz(quat[motion_slice]))
+            if motion_quat.shape[0] > 1:
+                motion_ang_vel = self._quat_diff_to_ang_vel(motion_quat)
+                ang_vel[motion_slice][0] = motion_ang_vel[0]
+                ang_vel[motion_slice][1:] = motion_ang_vel
+        return ang_vel
+
+    def _quat_diff_to_ang_vel(self, quat: torch.Tensor) -> torch.Tensor:
+        delta_q = quat_mul(quat[1:], quat_conjugate(quat[:-1]))
+        delta_q = quat_standardize_wxyz(quat_normalize_wxyz(delta_q))
+        delta_q_v = delta_q[..., 1:]
+        v_norm = delta_q_v.norm(dim=-1, keepdim=True)
+        theta = 2.0 * torch.atan2(v_norm, delta_q[..., 0:1].abs())
+
+        axis = torch.zeros_like(delta_q_v)
+        mask = v_norm.squeeze(-1) > 1e-7
+        sign = torch.sign(delta_q[..., 0:1])
+        sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+        axis[mask] = (delta_q_v[mask] / v_norm[mask]) * sign[mask]
+        return (theta / self.dt) * axis
+
     def _build_state_frames(self) -> torch.Tensor:
         root_rot6d = quat_to_rot6d(self.root_quat_w)
         object_rot6d = quat_to_rot6d(self.object_quat_w)
         if self.use_vel:
             joint_vel = self.joint_vel
-            root_vel_w = self.root_vel_w
-            object_vel_w = self.object_vel_w
+            root_lin_vel_w = self.root_lin_vel_w
+            root_ang_vel_w = self.root_ang_vel_w
+            object_lin_vel_w = self.object_lin_vel_w
+            object_ang_vel_w = self.object_ang_vel_w
         else:
             joint_vel = self._pos_to_vel(self.joint_pos)
-            root_vel_w = self._pos_to_vel(self.root_pos_w)
-            object_vel_w = self._pos_to_vel(self.object_pos_w)
+            root_lin_vel_w = self._pos_to_vel(self.root_pos_w)
+            root_ang_vel_w = self._quat_to_vel(self.root_quat_w)
+            object_lin_vel_w = self._pos_to_vel(self.object_pos_w)
+            object_ang_vel_w = self._quat_to_vel(self.object_quat_w)
         chunk = torch.cat(
                 [
                     self.joint_pos,
                     joint_vel,
                     self.root_pos_w,
                     root_rot6d,
-                    root_vel_w,
+                    root_lin_vel_w,
+                    root_ang_vel_w,
                     self.object_pos_w,
                     object_rot6d,
-                    object_vel_w,
+                    object_lin_vel_w,
+                    object_ang_vel_w,
                 ],
                 dim=-1,
             )
@@ -410,10 +458,12 @@ class MotionLoader(Dataset):
         out = chunk.clone()
         root_pos = out[..., self.root_pos_slice]
         root_rot6d = out[..., self.root_rot6d_slice]
-        root_vel = out[..., self.root_vel_slice]
+        root_lin_vel = out[..., self.root_lin_vel_slice]
+        root_ang_vel = out[..., self.root_ang_vel_slice]
         object_pos = out[..., self.object_pos_slice]
         object_rot6d = out[..., self.object_rot6d_slice]
-        object_vel = out[..., self.object_vel_slice]
+        object_lin_vel = out[..., self.object_lin_vel_slice]
+        object_ang_vel = out[..., self.object_ang_vel_slice]
 
         root_pos_rel = root_pos.clone()
         root_pos_rel[..., :2] = root_pos_rel[..., :2] - root_pos_rel[0:1, :2]
@@ -428,11 +478,13 @@ class MotionLoader(Dataset):
         object_rotmat_0_inv = object_rotmat_0.transpose(-1, -2)
 
         out[..., self.root_pos_slice] = torch.matmul(root_rotmat_0_inv, root_pos_rel.unsqueeze(-1)).squeeze(-1)
-        out[..., self.root_vel_slice] = torch.matmul(root_rotmat_0_inv, root_vel.unsqueeze(-1)).squeeze(-1)
+        out[..., self.root_lin_vel_slice] = torch.matmul(root_rotmat_0_inv, root_lin_vel.unsqueeze(-1)).squeeze(-1)
+        out[..., self.root_ang_vel_slice] = torch.matmul(root_rotmat_0_inv, root_ang_vel.unsqueeze(-1)).squeeze(-1)
         out[..., self.root_rot6d_slice] = rot6d_from_matrix(torch.matmul(root_rotmat_0_inv, root_rotmat))
 
         out[..., self.object_pos_slice] = torch.matmul(object_rotmat_0_inv, object_pos_rel.unsqueeze(-1)).squeeze(-1)
-        out[..., self.object_vel_slice] = torch.matmul(object_rotmat_0_inv, object_vel.unsqueeze(-1)).squeeze(-1)
+        out[..., self.object_lin_vel_slice] = torch.matmul(object_rotmat_0_inv, object_lin_vel.unsqueeze(-1)).squeeze(-1)
+        out[..., self.object_ang_vel_slice] = torch.matmul(object_rotmat_0_inv, object_ang_vel.unsqueeze(-1)).squeeze(-1)
         out[..., self.object_rot6d_slice] = rot6d_from_matrix(torch.matmul(object_rotmat_0_inv, object_rotmat))
         return out
 
@@ -446,9 +498,11 @@ class MotionLoader(Dataset):
     ) -> torch.Tensor:
         out = chunk.clone()
         root_pos = out[..., self.root_pos_slice]
-        root_vel = out[..., self.root_vel_slice]
+        root_lin_vel = out[..., self.root_lin_vel_slice]
+        root_ang_vel = out[..., self.root_ang_vel_slice]
         object_pos = out[..., self.object_pos_slice]
-        object_vel = out[..., self.object_vel_slice]
+        object_lin_vel = out[..., self.object_lin_vel_slice]
+        object_ang_vel = out[..., self.object_ang_vel_slice]
         root_rotmat = rot6d_to_matrix(out[..., self.root_rot6d_slice])
         object_rotmat = rot6d_to_matrix(out[..., self.object_rot6d_slice])
         root0_rotmat = rot6d_to_matrix(quat_to_rot6d(quat_standardize_wxyz(quat_normalize_wxyz(root0_quat))).unsqueeze(0))
@@ -461,13 +515,15 @@ class MotionLoader(Dataset):
         root_pos_world = torch.matmul(root0_rotmat, root_pos.unsqueeze(-1)).squeeze(-1)
         root_pos_world[..., :2] = root_pos_world[..., :2] + root0_pos[:2]
         out[..., self.root_pos_slice] = root_pos_world
-        out[..., self.root_vel_slice] = torch.matmul(root0_rotmat, root_vel.unsqueeze(-1)).squeeze(-1)
+        out[..., self.root_lin_vel_slice] = torch.matmul(root0_rotmat, root_lin_vel.unsqueeze(-1)).squeeze(-1)
+        out[..., self.root_ang_vel_slice] = torch.matmul(root0_rotmat, root_ang_vel.unsqueeze(-1)).squeeze(-1)
         out[..., self.root_rot6d_slice] = rot6d_from_matrix(torch.matmul(root0_rotmat, root_rotmat))
 
         object_pos_world = torch.matmul(object0_rotmat, object_pos.unsqueeze(-1)).squeeze(-1)
         object_pos_world[..., :2] = object_pos_world[..., :2] + object0_pos[:2]
         out[..., self.object_pos_slice] = object_pos_world
-        out[..., self.object_vel_slice] = torch.matmul(object0_rotmat, object_vel.unsqueeze(-1)).squeeze(-1)
+        out[..., self.object_lin_vel_slice] = torch.matmul(object0_rotmat, object_lin_vel.unsqueeze(-1)).squeeze(-1)
+        out[..., self.object_ang_vel_slice] = torch.matmul(object0_rotmat, object_ang_vel.unsqueeze(-1)).squeeze(-1)
         out[..., self.object_rot6d_slice] = rot6d_from_matrix(torch.matmul(object0_rotmat, object_rotmat))
         return out
 
@@ -491,23 +547,41 @@ class MotionLoader(Dataset):
             chunk = self.denormalize(chunk)
 
         if chunk.shape[-2] < 2:
-            return {"root_vel_fd_mse": 0.0, "joint_vel_fd_mse": 0.0, "object_vel_fd_mse": 0.0}
+            return {
+                "root_vel_fd_mse": 0.0,
+                "joint_vel_fd_mse": 0.0,
+                "object_vel_fd_mse": 0.0,
+                "root_ang_vel_fd_mse": 0.0,
+                "object_ang_vel_fd_mse": 0.0,
+            }
 
         root_pos = chunk[..., self.root_pos_slice]
-        root_vel = chunk[..., self.root_vel_slice]
+        root_lin_vel = chunk[..., self.root_lin_vel_slice]
+        root_rot_quat = quat_standardize_wxyz(
+            quat_normalize_wxyz(rot6d_to_quat_wxyz(chunk[..., self.root_rot6d_slice]))
+        )
+        root_ang_vel = chunk[..., self.root_ang_vel_slice]
         joint_pos = chunk[..., self.joint_pos_slice]
         joint_vel = chunk[..., self.joint_vel_slice]
         object_pos = chunk[..., self.object_pos_slice]
-        object_vel = chunk[..., self.object_vel_slice]
+        object_rot_quat = quat_standardize_wxyz(
+            quat_normalize_wxyz(rot6d_to_quat_wxyz(chunk[..., self.object_rot6d_slice]))
+        )
+        object_lin_vel = chunk[..., self.object_lin_vel_slice]
+        object_ang_vel = chunk[..., self.object_ang_vel_slice]
 
-        root_vel_fd = torch.diff(root_pos, dim=-2) * self.fps
+        root_lin_vel_fd = torch.diff(root_pos, dim=-2) * self.fps
+        root_ang_vel_fd = self._quat_diff_to_ang_vel(root_rot_quat)
         joint_vel_fd = torch.diff(joint_pos, dim=-2) * self.fps
-        object_vel_fd = torch.diff(object_pos, dim=-2) * self.fps
+        object_lin_vel_fd = torch.diff(object_pos, dim=-2) * self.fps
+        object_ang_vel_fd = self._quat_diff_to_ang_vel(object_rot_quat)
 
         return {
-            "root_vel_fd_mse": torch.mean((root_vel[1:] - root_vel_fd) ** 2).item(),
+            "root_vel_fd_mse": torch.mean((root_lin_vel[1:] - root_lin_vel_fd) ** 2).item(),
             "joint_vel_fd_mse": torch.mean((joint_vel[1:] - joint_vel_fd) ** 2).item(),
-            "object_vel_fd_mse": torch.mean((object_vel[1:] - object_vel_fd) ** 2).item(),
+            "object_vel_fd_mse": torch.mean((object_lin_vel[1:] - object_lin_vel_fd) ** 2).item(),
+            "root_ang_vel_fd_mse": torch.mean((root_ang_vel[1:] - root_ang_vel_fd) ** 2).item(),
+            "object_ang_vel_fd_mse": torch.mean((object_ang_vel[1:] - object_ang_vel_fd) ** 2).item(),
         }
 
     def get_stats(self) -> dict[str, torch.Tensor]:
