@@ -13,6 +13,7 @@ class DatasetConfig:
     make_relative: bool = True
     normalize: bool = True
     use_vel: bool = True
+    use_contact_label: bool = False
     use_stats_cache: bool = True
 
 
@@ -111,6 +112,11 @@ def parse_args() -> Config:
 
     parser.add_argument("--seq-len", type=int, default=DatasetConfig.seq_len)
     parser.add_argument("--stride", type=int, default=DatasetConfig.stride)
+    parser.add_argument(
+        "--use-contact-label",
+        action=argparse.BooleanOptionalAction,
+        default=DatasetConfig.use_contact_label,
+    )
     parser.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
     parser.add_argument("--epochs", type=int, default=TrainConfig.epochs)
     parser.add_argument("--num-workers", type=int, default=TrainConfig.num_workers)
@@ -152,6 +158,7 @@ def parse_args() -> Config:
             npz_path=args.data,
             seq_len=args.seq_len,
             stride=args.stride,
+            use_contact_label=args.use_contact_label,
         ),
         model=ModelConfig(
             use_dit=args.use_dit,

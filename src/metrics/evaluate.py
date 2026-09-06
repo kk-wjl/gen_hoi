@@ -1,388 +1,317 @@
-"""
-1. hand sliding
-2. feet sliding
-3. object sliding
+"""Geometry-based metrics for generated G1-object motions."""
 
-what we need:
-1. determine when G1 is in contact
-support two formats:
-contact label and calculated distance
-2. relative velocity of contact points
-
-what we try to calculate:
-Foot Sliding Score
-
-support two different datasets:
-1. generative datasets
-root + object + joint + contact
-2. rl rollout datasets
-body + object + joint + contact
-
-chunk(generated/rl collected):
-root/body(pos + lin_vel + ang_vel + quat/rot6d) +
-object(pos + lin_vel + ang_vel + quat/rot6d) + joint (pos + vel) 
-+ contact(contact label/or more)
-
-missing part: 
-normal vector calculation
-hand distance calculation: query + minimum
-"""
+from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
-import numpy as np
+from metrics.fk import BODY_INDEX
+from metrics.query import (
+    get_query_body_indices,
+    get_query_point,
+    query_object_geometry,
+)
 
-from metrics.fk import BODY_INDEX, FKEngine
-from metrics.query import query_object_signed_distance
 
-def contact_candidates(body: str):
-    # foot: left_ankle_roll_link/ right_ankle_roll_link
-    # hand: left_ankle_roll_link/ right_ankle_roll_link
-    if body == "foot":
-        body_names = ["left_ankle_roll_link", "right_ankle_roll_link"]
-    elif body == "hand":
-        body_names = ["left_wrist_yaw_link", "right_wrist_yaw_link"]
+def _region_body_indices(region: str) -> list[int]:
+    if region == "left_foot":
+        names = {"left_ankle_roll_link"}
+    elif region == "right_foot":
+        names = {"right_ankle_roll_link"}
+    elif region == "left_hand":
+        names = {"left_wrist_yaw_link"}
+        names.update(name for name in BODY_INDEX if name.startswith("L_"))
+    elif region == "right_hand":
+        names = {"right_wrist_yaw_link"}
+        names.update(name for name in BODY_INDEX if name.startswith("R_"))
+    elif region == "foot":
+        return _region_body_indices("left_foot") + _region_body_indices("right_foot")
+    elif region == "hand":
+        return _region_body_indices("left_hand") + _region_body_indices("right_hand")
     else:
-        raise ValueError(f"Unsupported contact body: {body}")
-    body_indices = [BODY_INDEX[name] for name in body_names]
-    return body_names, body_indices
+        raise ValueError(f"Unsupported collision-query region: {region}")
+    return [BODY_INDEX[name] for name in names]
 
-def compute_surface_normal(
-        chunk: dict[str, torch.Tensor],
-        body: str,
-        surface_normal: torch.Tensor | None = None,
-    ):
-    # option one: calculate from pose
-    # option two: get from simulation
-    # foot/ground: z vector
-    # hand/object: object surface vector
-    _, body_indices = contact_candidates(body)
-    seq_len = int(chunk["body_pos_w"].shape[0]) if "body_pos_w" in chunk else int(chunk["joint_pos"].shape[0])
-    num_candidates = len(body_indices)
 
-    if surface_normal is not None:
-        normal = surface_normal.to(dtype=torch.float32)
-        if normal.shape != (seq_len, num_candidates, 3):
-            raise ValueError(
-                f"surface_normal must have shape {(seq_len, num_candidates, 3)}, got {tuple(normal.shape)}"
-            )
-        return F.normalize(normal, dim=-1, eps=1e-8)
-
-    if body == "foot":
-        normal = torch.zeros(seq_len, num_candidates, 3, dtype=torch.float32)
-        normal[..., 2] = 1.0
-        return normal
-
-    normal = torch.zeros(seq_len, num_candidates, 3, dtype=torch.float32)
-    return normal
-
-def compute_relative_distance(
-        chunk: dict[str, torch.Tensor],
-        body: str,
-        fk_engine: FKEngine | None = None,
-        distance: torch.Tensor | None = None, # (T, K hand) setting as larger than 0
-    ):
-    # calculate relative distance between ground and feet or between hand and object
-    # option one: calculate from pose
-    # option two: get from simulation
-    # input: chunk
-    # output: calculated distance
-    _, body_indices = contact_candidates(body)
-
-    if "body_pos_w" in chunk:
-        body_pos_w = chunk["body_pos_w"].to(dtype=torch.float32)
-    else:
-        if fk_engine is None:
-            fk_engine = FKEngine()
-        fk_out = fk_engine.forward_kinematics(
-            joint_pos=chunk["joint_pos"],
-            root_pos=chunk["root_pos"],
-            root_quat=chunk["root_quat"],
-        )
-        body_pos_w = fk_out["body_pos_w"].to(dtype=torch.float32)
-
-    selected_body_pos = body_pos_w[:, body_indices, :]
-
-    if body == "foot":
-        return selected_body_pos[..., 2]
-    else:
-        return distance
-    
-def compute_relative_velocity(
-        chunk: dict[str, torch.Tensor],
-        body: str,
-        fk_engine: FKEngine | None = None,
-    ):
-    # calculate the relative velocity on contact surface if there is contact(by def determine_whether_in_contact)
-    # input: chunk
-    # output: calculated velocity
-    _, body_indices = contact_candidates(body)
-
-    if "body_lin_vel_w" in chunk:
-        body_lin_vel_w = chunk["body_lin_vel_w"].to(dtype=torch.float32)
-    else:
-        if "body_pos_w" in chunk:
-            body_pos_w = chunk["body_pos_w"].to(dtype=torch.float32)
-        else:
-            if fk_engine is None:
-                fk_engine = FKEngine()
-            fk_out = fk_engine.forward_kinematics(
-                joint_pos=chunk["joint_pos"],
-                root_pos=chunk["root_pos"],
-                root_quat=chunk["root_quat"],
-            )
-            body_pos_w = fk_out["body_pos_w"].to(dtype=torch.float32)
-        body_lin_vel_w = torch.zeros_like(body_pos_w)
-        if body_pos_w.shape[0] > 1:
-            body_lin_vel_w[1:] = body_pos_w[1:] - body_pos_w[:-1]
-            body_lin_vel_w[0] = body_lin_vel_w[1]
-
-    selected_body_vel = body_lin_vel_w[:, body_indices, :]
-
-    if body == "foot":
-        return selected_body_vel
-
-    if "object_lin_vel_w" in chunk:
-        object_lin_vel_w = chunk["object_lin_vel_w"].to(dtype=torch.float32)
-    else:
-        if "object_pos_w" not in chunk:
-            raise KeyError("Hand relative velocity requires object_pos_w or object_lin_vel_w in chunk")
-        object_pos_w = chunk["object_pos_w"].to(dtype=torch.float32)
-        object_lin_vel_w = torch.zeros_like(object_pos_w)
-        if object_pos_w.shape[0] > 1:
-            object_lin_vel_w[1:] = object_pos_w[1:] - object_pos_w[:-1]
-            object_lin_vel_w[0] = object_lin_vel_w[1]
-    return selected_body_vel - object_lin_vel_w.unsqueeze(1)
-
-def determine_whether_in_contact(
-        chunk: dict[str, torch.Tensor],
-        contact_label: torch.Tensor | None, # (T, K)
-        body: str,
-        fk_engine: FKEngine | None = None,
-        distance: torch.Tensor | None = None, # (T, K hand)
-    ) -> torch.Tensor:
-    # determine whether there is a contact
-    # option one: by contact label(for each body) 1 is in contact, 0 is not in contact
-    # option two: by geometrical relation and forward kinematic(if there is only root not body information)
-    _, body_indices = contact_candidates(body)
-
-    if contact_label is None and "contact_label" in chunk:
-        contact_label = chunk["contact_label"]
-
-    if contact_label is not None:
-        label = contact_label.to(dtype=torch.float32)
-        if label.shape[-1] == len(BODY_INDEX):
-            label = label[:, body_indices]
-        return label > 0.5
-
-    distance = compute_relative_distance(chunk, body=body, fk_engine=fk_engine, distance=distance)
-    if body == "foot":
-        threshold = torch.tensor(0.05, dtype=distance.dtype)
-    else:
-        threshold = torch.tensor(0.05, dtype=distance.dtype)
-    return distance <= threshold
-
-def compute_contact_weight(
-        chunk: dict[str, torch.Tensor],
-        contact_label: torch.Tensor | None,
-        body: str,
-        fk_engine: FKEngine | None = None,
-        distance: torch.Tensor | None = None, # (T, K hand)
-    ):
-    # we use contact_label as probability to be in contact, where 0 means no contact, 1 means in contact
-    # we use relative distance as threshold to determine, transform it to probabilty
-    # when using contact_label, contact_weight = contact_label
-    # when using threshold, contact_weight = f(relative_distance)
-    contact_mask = determine_whether_in_contact(
-        chunk,
-        contact_label=contact_label,
-        body=body,
-        fk_engine=fk_engine,
-        distance=distance
+def query_region_mask(query_body_indices: torch.Tensor, region: str) -> torch.Tensor:
+    """Select collision query points belonging to a semantic G1 region."""
+    region_indices = torch.as_tensor(
+        _region_body_indices(region),
+        dtype=torch.long,
+        device=query_body_indices.device,
     )
-    _, body_indices = contact_candidates(body)
+    mask = torch.isin(query_body_indices, region_indices)
+    if not mask.any():
+        raise ValueError(f"No collision query points found for region {region!r}")
+    return mask
 
-    if contact_label is None and "contact_label" in chunk:
-        contact_label = chunk["contact_label"]
 
-    if contact_label is not None:
-        label = contact_label.to(dtype=torch.float32)
-        if label.shape[-1] == len(BODY_INDEX):
-            label = label[:, body_indices]
-        return contact_mask.to(dtype=torch.float32) * label.clamp(0.0, 1.0)
+def _collision_geometry(
+        chunk: dict[str, torch.Tensor],
+        geometry: dict[str, torch.Tensor] | None,
+    ) -> dict[str, torch.Tensor]:
+    if geometry is not None:
+        return geometry
+    query_points_w = get_query_point(
+        chunk,
+    )
+    return {
+        "query_points_w": query_points_w,
+        "query_body_indices": get_query_body_indices(
+            device=query_points_w.device,
+        ),
+    }
 
-    distance = compute_relative_distance(chunk, body=body, fk_engine=fk_engine, distance=distance)
-    if body == "foot":
-        threshold = torch.tensor(0.05, dtype=distance.dtype)
-        softness = torch.tensor(0.01, dtype=distance.dtype)
-    else:
-        threshold = torch.tensor(0.05, dtype=distance.dtype)
-        softness = torch.tensor(0.02, dtype=distance.dtype)
-    softness = torch.clamp(softness, min=torch.finfo(distance.dtype).eps)
-    raw_weight = torch.sigmoid((threshold - distance) / softness)
-    return contact_mask.to(dtype=raw_weight.dtype) * raw_weight
 
-def compute_foot_sliding(
-        chunk: dict[str, torch.Tensor], 
+def _query_contact_weight(
+        chunk: dict[str, torch.Tensor],
+        query_body_indices: torch.Tensor,
         contact_label: torch.Tensor | None,
-        distance: torch.Tensor | None = None, # (T, K hand)
-    ):
-    # calculate the foot sliding score for the given chunk
-    # input: chunk
-    # output: FS score
-    v_rel = compute_relative_velocity(chunk, body="foot")
-    n = compute_surface_normal(chunk, body="foot")
-    contact_weight = compute_contact_weight(chunk, contact_label=contact_label, body="foot", distance=distance)
+    ) -> torch.Tensor:
+    if contact_label is None:
+        contact_label = chunk.get("contact_label")
+    if contact_label is None:
+        raise KeyError("Collision-query metrics require per-link contact_label")
+    if contact_label.ndim != 2 or contact_label.shape[1] != len(BODY_INDEX):
+        raise ValueError(
+            f"contact_label must have shape (T, {len(BODY_INDEX)}), got {tuple(contact_label.shape)}"
+        )
+    return contact_label.to(
+        device=query_body_indices.device,
+        dtype=torch.float32,
+    ).index_select(1, query_body_indices).clamp(0.0, 1.0)
 
-    tangent_v = v_rel - torch.sum(v_rel * n, dim=-1, keepdim=True) * n
-    tangent_speed = torch.linalg.norm(tangent_v, dim=-1)
 
-    weighted_speed = contact_weight * tangent_speed
-    return weighted_speed.mean()
+def _region_contact_weight(
+        chunk: dict[str, torch.Tensor],
+        owner: torch.Tensor,
+        region: str,
+        contact_label: torch.Tensor | None,
+    ) -> torch.Tensor:
+    return _query_contact_weight(chunk, owner, contact_label) * query_region_mask(owner, region).unsqueeze(0)
+
+
+def _region_contact_frames(
+        chunk: dict[str, torch.Tensor],
+        owner: torch.Tensor,
+        region: str,
+        contact_label: torch.Tensor | None,
+    ) -> torch.Tensor:
+    return _region_contact_weight(chunk, owner, region, contact_label).amax(dim=1)
+
+
+def _query_point_velocity(
+        chunk: dict[str, torch.Tensor],
+        geometry: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+    required = ("body_pos_w", "body_lin_vel_w", "body_ang_vel_w")
+    missing = [name for name in required if name not in chunk]
+    if missing:
+        raise KeyError(f"Query-point velocity requires {missing}")
+
+    owner = geometry["query_body_indices"]
+    query_points_w = geometry["query_points_w"]
+    body_pos_w = chunk["body_pos_w"].to(device=query_points_w.device, dtype=query_points_w.dtype)
+    body_lin_vel_w = chunk["body_lin_vel_w"].to(device=query_points_w.device, dtype=query_points_w.dtype)
+    body_ang_vel_w = chunk["body_ang_vel_w"].to(device=query_points_w.device, dtype=query_points_w.dtype)
+    owner_pos = body_pos_w.index_select(1, owner)
+    owner_lin_vel = body_lin_vel_w.index_select(1, owner)
+    owner_ang_vel = body_ang_vel_w.index_select(1, owner)
+    return owner_lin_vel + torch.cross(owner_ang_vel, query_points_w - owner_pos, dim=-1)
+
+
+def compute_hand_object_distance(
+        chunk: dict[str, torch.Tensor],
+        object_name: str,
+        *,
+        geometry: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+    """Return left/right hand minimum outside distances to the object, shape ``(T, 2)``."""
+    if geometry is None:
+        geometry = query_object_geometry(
+            chunk,
+            object_name,
+        )
+    owner = geometry["query_body_indices"]
+    outside_distance = geometry["signed_distance"].clamp_min(0.0)
+    valid = geometry["valid"]
+    distances: list[torch.Tensor] = []
+    for region in ("left_hand", "right_hand"):
+        mask = query_region_mask(owner, region)
+        distances.append(outside_distance.masked_fill(~(valid & mask.unsqueeze(0)), float("inf")).min(dim=1).values)
+    return torch.stack(distances, dim=-1)
+
+
+def compute_hand_object_sliding(
+        chunk: dict[str, torch.Tensor],
+        object_name: str,
+        contact_label: torch.Tensor | None = None,
+        *,
+        geometry: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+    """Contact-label-weighted tangential velocity across hand collision surfaces."""
+    if geometry is None:
+        geometry = query_object_geometry(
+            chunk,
+            object_name,
+        )
+    required = ("object_pos_w", "object_lin_vel_w", "object_ang_vel_w")
+    missing = [name for name in required if name not in chunk]
+    if missing:
+        raise KeyError(f"Hand-object sliding requires {missing}")
+
+    query_points_w = geometry["query_points_w"]
+    owner = geometry["query_body_indices"]
+    object_pos_w = chunk["object_pos_w"].to(device=query_points_w.device, dtype=query_points_w.dtype)
+    object_lin_vel_w = chunk["object_lin_vel_w"].to(device=query_points_w.device, dtype=query_points_w.dtype)
+    object_ang_vel_w = chunk["object_ang_vel_w"].to(device=query_points_w.device, dtype=query_points_w.dtype)
+    object_surface_velocity_w = object_lin_vel_w.unsqueeze(1) + torch.cross(
+        object_ang_vel_w.unsqueeze(1),
+        geometry["closest_points_w"] - object_pos_w.unsqueeze(1),
+        dim=-1,
+    )
+    relative_velocity_w = _query_point_velocity(chunk, geometry) - object_surface_velocity_w
+    normal_w = geometry["surface_normals_w"]
+    tangent_speed = torch.linalg.norm(
+        relative_velocity_w - (relative_velocity_w * normal_w).sum(dim=-1, keepdim=True) * normal_w,
+        dim=-1,
+    )
+    weight = _region_contact_weight(chunk, owner, "hand", contact_label)
+    weight = weight * geometry["valid"].to(dtype=weight.dtype)
+    return (weight * tangent_speed).sum() / (weight.shape[0] * query_region_mask(owner, "hand").sum())
+
 
 def compute_hand_sliding(
-        chunk: dict[str, torch.Tensor], 
+        chunk: dict[str, torch.Tensor],
         contact_label: torch.Tensor | None,
-        distance: torch.Tensor | None = None, # (T, K hand)
-    ):
-    # calculate the hand sliding score for the given chunk
-    # input: chunk
-    # output: HS score
-    v_rel = compute_relative_velocity(chunk, body="hand")
-    n = compute_surface_normal(chunk, body="hand")
-    contact_weight = compute_contact_weight(chunk, contact_label=contact_label, body="hand", distance=distance)
-
-    tangent_v = v_rel - torch.sum(v_rel * n, dim=-1, keepdim=True) * n
-    tangent_speed = torch.linalg.norm(tangent_v, dim=-1)
-
-    weighted_speed = contact_weight * tangent_speed
-    return weighted_speed.mean()
+        object_name: str,
+        *,
+        geometry: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+    """Compatibility entry point for collision-query hand-object sliding."""
+    return compute_hand_object_sliding(
+        chunk,
+        object_name,
+        contact_label=contact_label,
+        geometry=geometry,
+    )
 
 
-"""
-This scripts are used to determine the penetration scores and floating score.
+def compute_foot_sliding(
+        chunk: dict[str, torch.Tensor],
+        contact_label: torch.Tensor | None,
+        *,
+        geometry: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+    """Contact-label-weighted horizontal velocity of foot collision points."""
+    geometry = _collision_geometry(chunk, geometry)
+    owner = geometry["query_body_indices"]
+    foot_mask = query_region_mask(owner, "foot")
+    horizontal_speed = torch.linalg.norm(_query_point_velocity(chunk, geometry)[..., :2], dim=-1)
+    weight = _region_contact_weight(chunk, owner, "foot", contact_label)
+    return (weight * horizontal_speed).sum() / (weight.shape[0] * foot_mask.sum())
 
-"""
 
-# maybe adding contact_margin
 def compute_foot_penetration(
         chunk: dict[str, torch.Tensor],
-    ):
-    # get foot height and calculate penetration depth for each body during the frame
-    # penetration depth: (T, K)
-    # penetration score
-    foot_height = compute_relative_distance(chunk, body="foot")
-    penetration_depth = torch.clamp(-foot_height, min=0.0)
-    penetration_score = penetration_depth.mean() * 100.0
-    return penetration_score
+        *,
+        geometry: dict[str, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Mean floor penetration of the lowest point on each foot collision surface, in cm."""
+    geometry = _collision_geometry(chunk, geometry)
+    owner = geometry["query_body_indices"]
+    foot_height = torch.stack(
+        [
+            geometry["query_points_w"][:, query_region_mask(owner, region), 2].min(dim=1).values
+            for region in ("left_foot", "right_foot")
+        ],
+        dim=-1,
+    )
+    return foot_height.clamp_max(0.0).neg().mean() * 100.0
+
 
 def compute_foot_floating(
         chunk: dict[str, torch.Tensor],
         contact_label: torch.Tensor | None,
-    ):
-    # when contact_label says true
-    # get foot height and compare with threholds
-    # floating height: (T, K)
-    # floating score
-    foot_height = compute_relative_distance(chunk, body="foot")
-    floating_height = torch.clamp(foot_height, min=0.0) 
-    contact_weight = compute_contact_weight(chunk, contact_label=contact_label, body="foot")
-    floating_score = (floating_height * contact_weight).mean() * 100.0
-    return floating_score
-
-# after getting collision information between object and ground
-def get_object_height(chunk: dict[str, torch.Tensor],):
-    # object baseline height (T,)
-    object_pos_w = chunk["object_pos_w"]   # (T, 3)
-    seq_len = object_pos_w.shape[0]
-    object_baseline_height = torch.full(
-        (seq_len,),
-        0.361,
-        dtype=object_pos_w.dtype,
-        device=object_pos_w.device,
+        *,
+        geometry: dict[str, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Mean clearance above the floor when each foot is labelled in contact, in cm."""
+    geometry = _collision_geometry(chunk, geometry)
+    owner = geometry["query_body_indices"]
+    foot_height = torch.stack(
+        [
+            geometry["query_points_w"][:, query_region_mask(owner, region), 2].min(dim=1).values
+            for region in ("left_foot", "right_foot")
+        ],
+        dim=-1,
     )
-    return object_baseline_height
+    contact = torch.stack(
+        [_region_contact_frames(chunk, owner, region, contact_label) for region in ("left_foot", "right_foot")],
+        dim=-1,
+    )
+    return (foot_height.clamp_min(0.0) * contact).mean() * 100.0
+
+
+def get_object_height(chunk: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Legacy smalltable resting height used by ``compute_object_floating``."""
+    return torch.full(
+        (chunk["object_pos_w"].shape[0],),
+        0.361,
+        dtype=chunk["object_pos_w"].dtype,
+        device=chunk["object_pos_w"].device,
+    )
+
 
 def compute_object_floating(
         chunk: dict[str, torch.Tensor],
         contact_label: torch.Tensor | None,
-        distance: torch.Tensor | None = None, # (T, K hand)
-    ):
-    # object should not be floating when in contact
-    # object should be in ground when no contact
-    contact_weight = compute_contact_weight(chunk, contact_label=contact_label, body="hand", distance=distance)
-    contact_weight = contact_weight.max(dim=-1).values # either hand in contact
+        distance: torch.Tensor,
+        *,
+        geometry: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+    """Object clearance when free, or hand-object gap when the hand is in contact, in cm."""
+    geometry = _collision_geometry(chunk, geometry)
+    hand_contact = _region_contact_frames(chunk, geometry["query_body_indices"], "hand", contact_label)
+    hand_distance = distance.min(dim=-1).values
+    free_clearance = (chunk["object_pos_w"][..., 2] - get_object_height(chunk)).clamp_min(0.0)
+    return (free_clearance * (1.0 - hand_contact) + hand_distance * hand_contact).mean() * 100.0
 
-    distance = compute_relative_distance(chunk, body="hand", distance = distance) # (T, K)
-    hand_distance = distance.min(dim=-1).values # (T, )
-    object_height = get_object_height(chunk) # (T, )
-    object_pos_w = chunk["object_pos_w"] # (T, 3)
-    floating_height = torch.clamp(object_pos_w[..., 2] - object_height, min=0.0)
-
-    floating_score = (floating_height * (1 - contact_weight) + hand_distance * contact_weight).mean() * 100.0
-    return floating_score
 
 def compute_object_penetration(
         chunk: dict[str, torch.Tensor],
         object_name: str,
-        fk_engine: FKEngine | None = None,
-    ):
-    # penetration with body
-    # not with ground yet
-    signed_distance = query_object_signed_distance(
-        chunk,
-        object_name=object_name,
-        fk_engine=fk_engine,
-    )
-    penetration_depth = torch.clamp(-signed_distance, min=0.0)
-    penetration_score = penetration_depth.mean() * 100.0
-    return penetration_score
+        *,
+        geometry: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+    if geometry is None:
+        geometry = query_object_geometry(
+            chunk,
+            object_name=object_name,
+        )
+    return geometry["signed_distance"].clamp_max(0.0).neg().mean() * 100.0
+
 
 def free_object_motion_penalty(
         chunk: dict[str, torch.Tensor],
         contact_label: torch.Tensor | None,
-        distance: torch.Tensor | None = None, # (T, K hand)
-    ):
-    # object should be still when no contact
-    # OS score = v * contact_weight
-    v_rel = chunk["object_lin_vel_w"]
-    contact_weight = compute_contact_weight(chunk, contact_label=contact_label, body="hand", distance=distance)
-    contact_weight = contact_weight.max(dim=-1).values # either hand in contact
-    object_contact_weight = 1 - contact_weight
+        *,
+        geometry: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+    geometry = _collision_geometry(chunk, geometry)
+    hand_contact = _region_contact_frames(chunk, geometry["query_body_indices"], "hand", contact_label)
+    return ((1.0 - hand_contact) * torch.linalg.norm(chunk["object_lin_vel_w"], dim=-1)).mean()
 
-    speed = torch.linalg.norm(v_rel, dim=-1)
-
-    weighted_speed = object_contact_weight * speed
-    return weighted_speed.mean()
 
 def compute_contact_percentage(
         chunk: dict[str, torch.Tensor],
         contact_label: torch.Tensor | None,
-        distance: torch.Tensor | None = None, # (T, K hand)
-    ):
-    # contact time/ total time
-    contact_mask = determine_whether_in_contact(
-            chunk,
-            contact_label=contact_label,
-            body="hand",
-            fk_engine=None,
-            distance=distance
-        )
-    contact_frame_mask = contact_mask.any(dim=-1)   # (T,)
-    contact_percentage = contact_frame_mask.float().mean()
-    return contact_percentage
+        *,
+        geometry: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+    geometry = _collision_geometry(chunk, geometry)
+    return _region_contact_frames(chunk, geometry["query_body_indices"], "hand", contact_label).mean()
+
 
 def compute_contact_accuracy():
-    # not sure yet
-    # precision/recall/F1 score
-    # ground truth: contact label?
-    # predicted: distance?
+    """Reserved for precision/recall/F1 against geometry-derived contacts."""
     pass
-
-"""
-smoothness metrics:
-acceleration
-jerk
-diversity metrics:
-"""

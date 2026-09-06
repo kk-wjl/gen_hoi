@@ -181,6 +181,7 @@ def main() -> None:
         make_relative=config.dataset.make_relative,
         normalize=config.dataset.normalize,
         use_vel=config.dataset.use_vel,
+        use_contact_label=config.dataset.use_contact_label,
         use_stats_cache=config.dataset.use_stats_cache,
     )
     dataloader = DataLoader(

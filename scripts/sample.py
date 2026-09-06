@@ -104,33 +104,36 @@ def choose_indices(dataset_len: int, num_rollouts: int, seed: int) -> list[int]:
 
 def save_rollout_npz(
     path: Path,
-    pose: dict[str, torch.Tensor],
+    rollout: dict[str, torch.Tensor],
     fps: float,
-    *,
-    joint_vel: torch.Tensor | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "joint_pos": pose["joint_pos"].cpu().numpy(),
-        "root_pos_w": pose["root_pos"].cpu().numpy(),
-        "root_quat_w": pose["root_quat"].cpu().numpy(),
-        "object_pos_w": pose["object_pos"].cpu().numpy(),
-        "object_quat_w": pose["object_quat"].cpu().numpy(),
+        "joint_pos": rollout["joint_pos"].cpu().numpy(),
+        "joint_vel": rollout["joint_vel"].cpu().numpy(),
+        "root_pos_w": rollout["root_pos"].cpu().numpy(),
+        "root_quat_w": rollout["root_quat"].cpu().numpy(),
+        "root_lin_vel_w": rollout["root_lin_vel"].cpu().numpy(),
+        "root_ang_vel_w": rollout["root_ang_vel"].cpu().numpy(),
+        "object_pos_w": rollout["object_pos"].cpu().numpy(),
+        "object_quat_w": rollout["object_quat"].cpu().numpy(),
+        "object_lin_vel_w": rollout["object_lin_vel"].cpu().numpy(),
+        "object_ang_vel_w": rollout["object_ang_vel"].cpu().numpy(),
         "fps": np.asarray([fps], dtype=np.float32),
     }
-    if joint_vel is not None:
-        payload["joint_vel"] = joint_vel.cpu().numpy()
+    if "contact_label" in rollout:
+        payload["contact_label"] = (rollout["contact_label"] > 0.5).to(torch.float32).cpu().numpy()
     np.savez_compressed(
         path,
         **payload,
     )
 
 
-def cat_rollout_poses(poses: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    if not poses:
-        raise ValueError("poses must contain at least one rollout")
-    keys = ("joint_pos", "root_pos", "root_quat", "object_pos", "object_quat")
-    return {key: torch.cat([pose[key] for pose in poses], dim=0) for key in keys}
+def cat_rollouts(rollouts: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    if not rollouts:
+        raise ValueError("rollouts must contain at least one rollout")
+    keys = rollouts[0].keys()
+    return {key: torch.cat([rollout[key] for rollout in rollouts], dim=0) for key in keys}
 
 def sliding_rollout(
     dataset: MotionLoader,
@@ -225,6 +228,7 @@ def main() -> None:
         make_relative=config.dataset.make_relative,
         normalize=config.dataset.normalize,
         use_vel=config.dataset.use_vel,
+        use_contact_label=config.dataset.use_contact_label,
         use_stats_cache=config.dataset.use_stats_cache,
     )
     _, flow, checkpoint_epoch = load_checkpoint_model(checkpoint_path, config, dataset)
@@ -232,8 +236,7 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "rollout_metrics.jsonl"
-    rollout_poses: list[dict[str, torch.Tensor]] = []
-    rollout_joint_vels: list[torch.Tensor] = []
+    rollouts: list[dict[str, torch.Tensor]] = []
     metric_sums = {
         "root_vel_fd_mse": 0.0,
         "joint_vel_fd_mse": 0.0,
@@ -260,15 +263,13 @@ def main() -> None:
                 num_windows=args.num_windows,
                 device=device,
             )
-            pred_pose = dataset.chunk_to_pose(pred_world_chunk)
-            pred_joint_vel = pred_world_chunk[..., dataset.joint_vel_slice]
+            pred_rollout = dataset.chunk_to_rollout(pred_world_chunk)
             metrics = dataset.metrics(pred_world_chunk, normalized=False)
 
             rollout_name = f"rollout_{rollout_id:03d}.npz"
             rollout_path = output_dir / rollout_name
-            save_rollout_npz(rollout_path, pred_pose, dataset.fps, joint_vel=pred_joint_vel)
-            rollout_poses.append(pred_pose)
-            rollout_joint_vels.append(pred_joint_vel)
+            save_rollout_npz(rollout_path, pred_rollout, dataset.fps)
+            rollouts.append(pred_rollout)
 
             record = {
                 "rollout_id": rollout_id,
@@ -315,9 +316,8 @@ def main() -> None:
 
     save_rollout_npz(
         output_dir / "rollout.npz",
-        cat_rollout_poses(rollout_poses),
+        cat_rollouts(rollouts),
         dataset.fps,
-        joint_vel=torch.cat(rollout_joint_vels, dim=0),
     )
 
 

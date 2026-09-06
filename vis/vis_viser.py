@@ -13,7 +13,7 @@ import viser
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MOTION_PATH = REPO_ROOT / "vis" / "data" / "processed" / "smalltable_g1_replay_policy_success_vis.npz"
+DEFAULT_MOTION_PATH = REPO_ROOT / "vis" / "data" / "rollout_Concat_label_v_contact_dit.npz"
 DEFAULT_URDF_PATH = REPO_ROOT / "vis" / "assets" / "unitree_g1" / "g1_29dof_rev_1_0_with_inspire_hand_DFQ.urdf"
 DEFAULT_OBJECT_MESH_PATH = REPO_ROOT / "vis" / "assets" / "smalltable.stl"
 DEFAULT_HOST = "127.0.0.1"

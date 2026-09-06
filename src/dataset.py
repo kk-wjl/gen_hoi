@@ -52,6 +52,7 @@ ROOT_ANG_VEL_DIM = 3
 OBJECT_POS_DIM = 3
 OBJECT_LIN_VEL_DIM = 3
 OBJECT_ANG_VEL_DIM = 3
+CONTACT_LABEL_DIM = 54
 ROT6D_DIM = 6
 
 JOINT_POS_START = 0
@@ -74,7 +75,10 @@ OBJECT_LIN_VEL_START = OBJECT_ROT6D_END
 OBJECT_LIN_VEL_END = OBJECT_LIN_VEL_START + OBJECT_LIN_VEL_DIM
 OBJECT_ANG_VEL_START = OBJECT_LIN_VEL_END
 OBJECT_ANG_VEL_END = OBJECT_ANG_VEL_START + OBJECT_ANG_VEL_DIM
+CONTACT_LABEL_START = OBJECT_ANG_VEL_END
+CONTACT_LABEL_END = CONTACT_LABEL_START + CONTACT_LABEL_DIM
 FEATURE_DIM = OBJECT_ANG_VEL_END
+FEATURE_DIM_WITH_CONTACT_LABEL = CONTACT_LABEL_END
 MOTION_STATS_CACHE_VERSION = 1
 
 
@@ -102,6 +106,7 @@ def _motion_stats_fingerprint(
     seq_len: int,
     stride: int,
     make_relative: bool,
+    use_contact_label: bool,
 ) -> tuple[str, dict[str, Any]]:
     files: list[dict[str, Any]] = []
     for npz_path in npz_paths:
@@ -119,6 +124,7 @@ def _motion_stats_fingerprint(
         "seq_len": seq_len,
         "stride": stride,
         "make_relative": make_relative,
+        "use_contact_label": use_contact_label,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     digest = hashlib.sha256(raw).hexdigest()
@@ -129,6 +135,7 @@ def _try_load_motion_stats_cache(
     cache_path: Path,
     expected_digest: str,
     dtype: torch.dtype,
+    feature_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     if not cache_path.is_file():
         return None
@@ -149,7 +156,7 @@ def _try_load_motion_stats_cache(
     std = stats.get("std")
     if not isinstance(mean, list) or not isinstance(std, list):
         return None
-    if len(mean) != FEATURE_DIM or len(std) != FEATURE_DIM:
+    if len(mean) != feature_dim or len(std) != feature_dim:
         return None
     if not all(isinstance(x, (int, float)) for x in mean):
         return None
@@ -187,7 +194,9 @@ class MotionLoader(Dataset):
     Sliding-window dataset over HOI motion ``npz`` files.
 
     Unified per-frame state layout:
-    ``[joint_pos, joint_vel, root_pos, root_rot6d, root_lin_vel, root_ang_vel, object_pos, object_rot6d, object_lin_vel, object_ang_vel]``
+    ``[joint_pos, joint_vel, root_pos, root_rot6d, root_lin_vel, root_ang_vel, object_pos, object_rot6d, object_lin_vel, object_ang_vel, contact_label]``
+
+    ``contact_label`` is included only when ``use_contact_label=True``.
 
     A helper is provided to extract:
     ``[joint_pos, root_pos, root_quat_wxyz, object_pos, object_quat_wxyz]``
@@ -203,6 +212,7 @@ class MotionLoader(Dataset):
         normalize: bool = True,
         use_stats_cache: bool = True,
         use_vel: bool = True, # To avoid the raw dataset error
+        use_contact_label: bool = False,
         dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
@@ -218,6 +228,7 @@ class MotionLoader(Dataset):
         self.normalize_enabled = normalize
         self.use_stats_cache = use_stats_cache
         self.use_vel = use_vel
+        self.use_contact_label = use_contact_label
         self.dtype = dtype
 
         raw_list = [np.load(path, allow_pickle=True) for path in self.npz_paths]
@@ -272,6 +283,11 @@ class MotionLoader(Dataset):
             [torch.as_tensor(raw["object_ang_vel_w"], dtype=dtype) for raw in raw_list],
             dim=0,
         )
+        self.contact_label = (
+            torch.cat([torch.as_tensor(raw["contact_label"], dtype=dtype) for raw in raw_list], dim=0)
+            if self.use_contact_label
+            else None
+        )
 
         self.num_frames = self.joint_pos.shape[0]
         self.motion_slices, self.motion_lengths = self._build_motion_slices(raw_list)
@@ -286,7 +302,10 @@ class MotionLoader(Dataset):
         self.object_rot6d_slice = slice(OBJECT_ROT6D_START, OBJECT_ROT6D_END)
         self.object_lin_vel_slice = slice(OBJECT_LIN_VEL_START, OBJECT_LIN_VEL_END)
         self.object_ang_vel_slice = slice(OBJECT_ANG_VEL_START, OBJECT_ANG_VEL_END)
-        self.feature_dim = FEATURE_DIM
+        self.contact_label_slice = (
+            slice(CONTACT_LABEL_START, CONTACT_LABEL_END) if self.use_contact_label else None
+        )
+        self.feature_dim = FEATURE_DIM_WITH_CONTACT_LABEL if self.use_contact_label else FEATURE_DIM
 
         self.state_frames = self._build_state_frames()
         self.window_index = self._build_window_index()
@@ -347,22 +366,21 @@ class MotionLoader(Dataset):
             root_ang_vel_w = self._quat_to_vel(self.root_quat_w)
             object_lin_vel_w = self._pos_to_vel(self.object_pos_w)
             object_ang_vel_w = self._quat_to_vel(self.object_quat_w)
-        chunk = torch.cat(
-                [
-                    self.joint_pos,
-                    joint_vel,
-                    self.root_pos_w,
-                    root_rot6d,
-                    root_lin_vel_w,
-                    root_ang_vel_w,
-                    self.object_pos_w,
-                    object_rot6d,
-                    object_lin_vel_w,
-                    object_ang_vel_w,
-                ],
-                dim=-1,
-            )
-        return chunk
+        state = [
+            self.joint_pos,
+            joint_vel,
+            self.root_pos_w,
+            root_rot6d,
+            root_lin_vel_w,
+            root_ang_vel_w,
+            self.object_pos_w,
+            object_rot6d,
+            object_lin_vel_w,
+            object_ang_vel_w,
+        ]
+        if self.contact_label is not None:
+            state.append(self.contact_label)
+        return torch.cat(state, dim=-1)
 
     def _build_motion_slices(self, raw_list: list[Any]) -> tuple[list[slice], list[int]]:
         lengths: list[int] = []
@@ -404,12 +422,13 @@ class MotionLoader(Dataset):
                 self.seq_len,
                 self.stride,
                 self.make_relative_enabled,
+                self.use_contact_label,
             )
             cache_root = self.npz_paths[0].parent if len(self.npz_paths) == 1 else DEFAULT_DATA_PATH
             cache_stem = self.npz_paths[0].stem if len(self.npz_paths) == 1 else "multi_dataset"
             cache_dir = cache_root / ".gen_hoi_cache"
             cache_path = cache_dir / f"{cache_stem}_stats_{digest}.json"
-            cached = _try_load_motion_stats_cache(cache_path, digest, self.dtype)
+            cached = _try_load_motion_stats_cache(cache_path, digest, self.dtype, self.feature_dim)
             if cached is not None:
                 return cached
 
@@ -539,6 +558,21 @@ class MotionLoader(Dataset):
             "object_pos": chunk[..., self.object_pos_slice],
             "object_quat": object_quat,
         }
+
+    def chunk_to_rollout(self, chunk: torch.Tensor) -> dict[str, torch.Tensor]:
+        rollout = self.chunk_to_pose(chunk)
+        rollout.update(
+            {
+                "joint_vel": chunk[..., self.joint_vel_slice],
+                "root_lin_vel": chunk[..., self.root_lin_vel_slice],
+                "root_ang_vel": chunk[..., self.root_ang_vel_slice],
+                "object_lin_vel": chunk[..., self.object_lin_vel_slice],
+                "object_ang_vel": chunk[..., self.object_ang_vel_slice],
+            }
+        )
+        if self.contact_label_slice is not None:
+            rollout["contact_label"] = chunk[..., self.contact_label_slice]
+        return rollout
 
 
     def metrics(self, chunk: torch.Tensor, *, normalized: bool = True) -> dict[str, float]:
