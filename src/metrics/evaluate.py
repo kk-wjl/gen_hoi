@@ -32,19 +32,6 @@ def _region_body_indices(region: str) -> list[int]:
     return [BODY_INDEX[name] for name in names]
 
 
-def query_region_mask(query_body_indices: torch.Tensor, region: str) -> torch.Tensor:
-    """Select collision query points belonging to a semantic G1 region."""
-    region_indices = torch.as_tensor(
-        _region_body_indices(region),
-        dtype=torch.long,
-        device=query_body_indices.device,
-    )
-    mask = torch.isin(query_body_indices, region_indices)
-    if not mask.any():
-        raise ValueError(f"No collision query points found for region {region!r}")
-    return mask
-
-
 def _collision_geometry(
         chunk: dict[str, torch.Tensor],
         geometry: dict[str, torch.Tensor] | None,
@@ -62,41 +49,23 @@ def _collision_geometry(
     }
 
 
-def _query_contact_weight(
+def _contact_weight(
         chunk: dict[str, torch.Tensor],
-        query_body_indices: torch.Tensor,
+        owner: torch.Tensor,
+        region: str,
         contact_label: torch.Tensor | None,
     ) -> torch.Tensor:
+    """Expand per-link labels to collision points and keep one semantic region."""
     if contact_label is None:
         contact_label = chunk.get("contact_label")
     if contact_label is None:
         raise KeyError("Collision-query metrics require per-link contact_label")
-    if contact_label.ndim != 2 or contact_label.shape[1] != len(BODY_INDEX):
-        raise ValueError(
-            f"contact_label must have shape (T, {len(BODY_INDEX)}), got {tuple(contact_label.shape)}"
-        )
+    region_indices = torch.as_tensor(_region_body_indices(region), dtype=torch.long, device=owner.device)
+    region_mask = torch.isin(owner, region_indices)
     return contact_label.to(
-        device=query_body_indices.device,
+        device=owner.device,
         dtype=torch.float32,
-    ).index_select(1, query_body_indices).clamp(0.0, 1.0)
-
-
-def _region_contact_weight(
-        chunk: dict[str, torch.Tensor],
-        owner: torch.Tensor,
-        region: str,
-        contact_label: torch.Tensor | None,
-    ) -> torch.Tensor:
-    return _query_contact_weight(chunk, owner, contact_label) * query_region_mask(owner, region).unsqueeze(0)
-
-
-def _region_contact_frames(
-        chunk: dict[str, torch.Tensor],
-        owner: torch.Tensor,
-        region: str,
-        contact_label: torch.Tensor | None,
-    ) -> torch.Tensor:
-    return _region_contact_weight(chunk, owner, region, contact_label).amax(dim=1)
+    ).index_select(1, owner).clamp(0.0, 1.0) * region_mask.unsqueeze(0)
 
 
 def _query_point_velocity(
@@ -136,7 +105,8 @@ def compute_hand_object_distance(
     valid = geometry["valid"]
     distances: list[torch.Tensor] = []
     for region in ("left_hand", "right_hand"):
-        mask = query_region_mask(owner, region)
+        region_indices = torch.as_tensor(_region_body_indices(region), dtype=torch.long, device=owner.device)
+        mask = torch.isin(owner, region_indices)
         distances.append(outside_distance.masked_fill(~(valid & mask.unsqueeze(0)), float("inf")).min(dim=1).values)
     return torch.stack(distances, dim=-1)
 
@@ -175,9 +145,11 @@ def compute_hand_object_sliding(
         relative_velocity_w - (relative_velocity_w * normal_w).sum(dim=-1, keepdim=True) * normal_w,
         dim=-1,
     )
-    weight = _region_contact_weight(chunk, owner, "hand", contact_label)
+    weight = _contact_weight(chunk, owner, "hand", contact_label)
     weight = weight * geometry["valid"].to(dtype=weight.dtype)
-    return (weight * tangent_speed).sum() / (weight.shape[0] * query_region_mask(owner, "hand").sum())
+    hand_indices = torch.as_tensor(_region_body_indices("hand"), dtype=torch.long, device=owner.device)
+    hand_mask = torch.isin(owner, hand_indices)
+    return (weight * tangent_speed).sum() / (weight.shape[0] * hand_mask.sum())
 
 
 def compute_hand_sliding(
@@ -205,9 +177,10 @@ def compute_foot_sliding(
     """Contact-label-weighted horizontal velocity of foot collision points."""
     geometry = _collision_geometry(chunk, geometry)
     owner = geometry["query_body_indices"]
-    foot_mask = query_region_mask(owner, "foot")
+    foot_indices = torch.as_tensor(_region_body_indices("foot"), dtype=torch.long, device=owner.device)
+    foot_mask = torch.isin(owner, foot_indices)
     horizontal_speed = torch.linalg.norm(_query_point_velocity(chunk, geometry)[..., :2], dim=-1)
-    weight = _region_contact_weight(chunk, owner, "foot", contact_label)
+    weight = _contact_weight(chunk, owner, "foot", contact_label)
     return (weight * horizontal_speed).sum() / (weight.shape[0] * foot_mask.sum())
 
 
@@ -221,7 +194,10 @@ def compute_foot_penetration(
     owner = geometry["query_body_indices"]
     foot_height = torch.stack(
         [
-            geometry["query_points_w"][:, query_region_mask(owner, region), 2].min(dim=1).values
+            geometry["query_points_w"][:, torch.isin(
+                owner,
+                torch.as_tensor(_region_body_indices(region), dtype=torch.long, device=owner.device),
+            ), 2].min(dim=1).values
             for region in ("left_foot", "right_foot")
         ],
         dim=-1,
@@ -240,20 +216,26 @@ def compute_foot_floating(
     owner = geometry["query_body_indices"]
     foot_height = torch.stack(
         [
-            geometry["query_points_w"][:, query_region_mask(owner, region), 2].min(dim=1).values
+            geometry["query_points_w"][:, torch.isin(
+                owner,
+                torch.as_tensor(_region_body_indices(region), dtype=torch.long, device=owner.device),
+            ), 2].min(dim=1).values
             for region in ("left_foot", "right_foot")
         ],
         dim=-1,
     )
     contact = torch.stack(
-        [_region_contact_frames(chunk, owner, region, contact_label) for region in ("left_foot", "right_foot")],
+        [
+            _contact_weight(chunk, owner, region, contact_label).amax(dim=1)
+            for region in ("left_foot", "right_foot")
+        ],
         dim=-1,
     )
     return (foot_height.clamp_min(0.0) * contact).mean() * 100.0
 
 
 def get_object_height(chunk: dict[str, torch.Tensor]) -> torch.Tensor:
-    """Legacy smalltable resting height used by ``compute_object_floating``."""
+    """Smalltable resting height used by ``compute_object_floating``."""
     return torch.full(
         (chunk["object_pos_w"].shape[0],),
         0.361,
@@ -271,7 +253,12 @@ def compute_object_floating(
     ) -> torch.Tensor:
     """Object clearance when free, or hand-object gap when the hand is in contact, in cm."""
     geometry = _collision_geometry(chunk, geometry)
-    hand_contact = _region_contact_frames(chunk, geometry["query_body_indices"], "hand", contact_label)
+    hand_contact = _contact_weight(
+        chunk,
+        geometry["query_body_indices"],
+        "hand",
+        contact_label,
+    ).amax(dim=1)
     hand_distance = distance.min(dim=-1).values
     free_clearance = (chunk["object_pos_w"][..., 2] - get_object_height(chunk)).clamp_min(0.0)
     return (free_clearance * (1.0 - hand_contact) + hand_distance * hand_contact).mean() * 100.0
@@ -298,7 +285,12 @@ def free_object_motion_penalty(
         geometry: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
     geometry = _collision_geometry(chunk, geometry)
-    hand_contact = _region_contact_frames(chunk, geometry["query_body_indices"], "hand", contact_label)
+    hand_contact = _contact_weight(
+        chunk,
+        geometry["query_body_indices"],
+        "hand",
+        contact_label,
+    ).amax(dim=1)
     return ((1.0 - hand_contact) * torch.linalg.norm(chunk["object_lin_vel_w"], dim=-1)).mean()
 
 
@@ -309,7 +301,12 @@ def compute_contact_percentage(
         geometry: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
     geometry = _collision_geometry(chunk, geometry)
-    return _region_contact_frames(chunk, geometry["query_body_indices"], "hand", contact_label).mean()
+    return _contact_weight(
+        chunk,
+        geometry["query_body_indices"],
+        "hand",
+        contact_label,
+    ).amax(dim=1).mean()
 
 
 def compute_contact_accuracy():
