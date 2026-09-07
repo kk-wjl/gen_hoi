@@ -10,10 +10,11 @@ wheels/
 .venv
 data/
 tests/
-# Keep the metric integration test tracked while leaving local test data ignored.
+# Keep executable tests tracked while leaving local test data ignored.
 !tests/
 tests/*
 !tests/test_metrics.py
+!tests/test_dataset_geometry.py
 vis/assets/
 src/assets/
 src/objects/

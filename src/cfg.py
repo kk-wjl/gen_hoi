@@ -14,6 +14,8 @@ class DatasetConfig:
     normalize: bool = True
     use_vel: bool = True
     use_contact_label: bool = False
+    use_closest_points: bool = False
+    use_surface_normals: bool = False
     use_stats_cache: bool = True
 
 
@@ -117,6 +119,16 @@ def parse_args() -> Config:
         action=argparse.BooleanOptionalAction,
         default=DatasetConfig.use_contact_label,
     )
+    parser.add_argument(
+        "--use-closest-points",
+        action=argparse.BooleanOptionalAction,
+        default=DatasetConfig.use_closest_points,
+    )
+    parser.add_argument(
+        "--use-surface-normals",
+        action=argparse.BooleanOptionalAction,
+        default=DatasetConfig.use_surface_normals,
+    )
     parser.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
     parser.add_argument("--epochs", type=int, default=TrainConfig.epochs)
     parser.add_argument("--num-workers", type=int, default=TrainConfig.num_workers)
@@ -159,6 +171,8 @@ def parse_args() -> Config:
             seq_len=args.seq_len,
             stride=args.stride,
             use_contact_label=args.use_contact_label,
+            use_closest_points=args.use_closest_points,
+            use_surface_normals=args.use_surface_normals,
         ),
         model=ModelConfig(
             use_dit=args.use_dit,

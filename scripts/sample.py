@@ -15,6 +15,7 @@ import torch
 from cfg import Config, config_from_dict
 from dataset import MotionLoader
 from flow import LinearFlow
+from metrics.query import FINGERTIP_NAMES
 from models.dit import DiffusionTransformer1D
 from models.unet import ConditionalUNet1D
 from utils.checkpoint import read_training_checkpoint_config
@@ -123,6 +124,16 @@ def save_rollout_npz(
     }
     if "contact_label" in rollout:
         payload["contact_label"] = (rollout["contact_label"] > 0.5).to(torch.float32).cpu().numpy()
+    for key in (
+        "fingertip_closest_points_o",
+        "fingertip_closest_points_w",
+        "fingertip_surface_normals_o",
+        "fingertip_surface_normals_w",
+    ):
+        if key in rollout:
+            payload[key] = rollout[key].cpu().numpy()
+    if "fingertip_closest_points_w" in rollout or "fingertip_surface_normals_w" in rollout:
+        payload["fingertip_names"] = np.asarray(FINGERTIP_NAMES)
     np.savez_compressed(
         path,
         **payload,
@@ -229,6 +240,8 @@ def main() -> None:
         normalize=config.dataset.normalize,
         use_vel=config.dataset.use_vel,
         use_contact_label=config.dataset.use_contact_label,
+        use_closest_points=config.dataset.use_closest_points,
+        use_surface_normals=config.dataset.use_surface_normals,
         use_stats_cache=config.dataset.use_stats_cache,
     )
     _, flow, checkpoint_epoch = load_checkpoint_model(checkpoint_path, config, dataset)

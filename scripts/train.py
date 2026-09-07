@@ -182,6 +182,8 @@ def main() -> None:
         normalize=config.dataset.normalize,
         use_vel=config.dataset.use_vel,
         use_contact_label=config.dataset.use_contact_label,
+        use_closest_points=config.dataset.use_closest_points,
+        use_surface_normals=config.dataset.use_surface_normals,
         use_stats_cache=config.dataset.use_stats_cache,
     )
     dataloader = DataLoader(

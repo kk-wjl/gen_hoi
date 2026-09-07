@@ -52,7 +52,7 @@ ROOT_ANG_VEL_DIM = 3
 OBJECT_POS_DIM = 3
 OBJECT_LIN_VEL_DIM = 3
 OBJECT_ANG_VEL_DIM = 3
-CONTACT_LABEL_DIM = 54
+FINGERTIP_COUNT = 10
 ROT6D_DIM = 6
 
 JOINT_POS_START = 0
@@ -75,11 +75,8 @@ OBJECT_LIN_VEL_START = OBJECT_ROT6D_END
 OBJECT_LIN_VEL_END = OBJECT_LIN_VEL_START + OBJECT_LIN_VEL_DIM
 OBJECT_ANG_VEL_START = OBJECT_LIN_VEL_END
 OBJECT_ANG_VEL_END = OBJECT_ANG_VEL_START + OBJECT_ANG_VEL_DIM
-CONTACT_LABEL_START = OBJECT_ANG_VEL_END
-CONTACT_LABEL_END = CONTACT_LABEL_START + CONTACT_LABEL_DIM
 FEATURE_DIM = OBJECT_ANG_VEL_END
-FEATURE_DIM_WITH_CONTACT_LABEL = CONTACT_LABEL_END
-MOTION_STATS_CACHE_VERSION = 1
+MOTION_STATS_CACHE_VERSION = 2
 
 
 def _normalize_npz_paths(npz_path: str | Path | list[str | Path] | tuple[str | Path, ...]) -> list[Path]:
@@ -107,6 +104,8 @@ def _motion_stats_fingerprint(
     stride: int,
     make_relative: bool,
     use_contact_label: bool,
+    use_closest_points: bool,
+    use_surface_normals: bool,
 ) -> tuple[str, dict[str, Any]]:
     files: list[dict[str, Any]] = []
     for npz_path in npz_paths:
@@ -125,6 +124,8 @@ def _motion_stats_fingerprint(
         "stride": stride,
         "make_relative": make_relative,
         "use_contact_label": use_contact_label,
+        "use_closest_points": use_closest_points,
+        "use_surface_normals": use_surface_normals,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     digest = hashlib.sha256(raw).hexdigest()
@@ -194,9 +195,10 @@ class MotionLoader(Dataset):
     Sliding-window dataset over HOI motion ``npz`` files.
 
     Unified per-frame state layout:
-    ``[joint_pos, joint_vel, root_pos, root_rot6d, root_lin_vel, root_ang_vel, object_pos, object_rot6d, object_lin_vel, object_ang_vel, contact_label]``
+    ``[joint_pos, joint_vel, root_pos, root_rot6d, root_lin_vel, root_ang_vel, object_pos, object_rot6d, object_lin_vel, object_ang_vel, contact_label, fingertip_geometry]``
 
-    ``contact_label`` is included only when ``use_contact_label=True``.
+    Contact labels and object-local fingertip geometry are included only when
+    their corresponding ``use_*`` flags are enabled.
 
     A helper is provided to extract:
     ``[joint_pos, root_pos, root_quat_wxyz, object_pos, object_quat_wxyz]``
@@ -213,6 +215,8 @@ class MotionLoader(Dataset):
         use_stats_cache: bool = True,
         use_vel: bool = True, # To avoid the raw dataset error
         use_contact_label: bool = False,
+        use_closest_points: bool = False,
+        use_surface_normals: bool = False,
         dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
@@ -229,6 +233,8 @@ class MotionLoader(Dataset):
         self.use_stats_cache = use_stats_cache
         self.use_vel = use_vel
         self.use_contact_label = use_contact_label
+        self.use_closest_points = use_closest_points
+        self.use_surface_normals = use_surface_normals
         self.dtype = dtype
 
         raw_list = [np.load(path, allow_pickle=True) for path in self.npz_paths]
@@ -288,6 +294,22 @@ class MotionLoader(Dataset):
             if self.use_contact_label
             else None
         )
+        self.fingertip_closest_points_o = (
+            torch.cat(
+                [torch.as_tensor(raw["fingertip_closest_points_o"], dtype=dtype) for raw in raw_list],
+                dim=0,
+            )
+            if self.use_closest_points
+            else None
+        )
+        self.fingertip_surface_normals_o = (
+            torch.cat(
+                [torch.as_tensor(raw["fingertip_surface_normals_o"], dtype=dtype) for raw in raw_list],
+                dim=0,
+            )
+            if self.use_surface_normals
+            else None
+        )
 
         self.num_frames = self.joint_pos.shape[0]
         self.motion_slices, self.motion_lengths = self._build_motion_slices(raw_list)
@@ -302,10 +324,28 @@ class MotionLoader(Dataset):
         self.object_rot6d_slice = slice(OBJECT_ROT6D_START, OBJECT_ROT6D_END)
         self.object_lin_vel_slice = slice(OBJECT_LIN_VEL_START, OBJECT_LIN_VEL_END)
         self.object_ang_vel_slice = slice(OBJECT_ANG_VEL_START, OBJECT_ANG_VEL_END)
-        self.contact_label_slice = (
-            slice(CONTACT_LABEL_START, CONTACT_LABEL_END) if self.use_contact_label else None
-        )
-        self.feature_dim = FEATURE_DIM_WITH_CONTACT_LABEL if self.use_contact_label else FEATURE_DIM
+        self._optional_state_features: list[torch.Tensor] = []
+        next_feature_start = FEATURE_DIM
+        for slice_name, feature in (
+            ("contact_label_slice", self.contact_label),
+            (
+                "fingertip_closest_points_slice",
+                self.fingertip_closest_points_o.flatten(start_dim=1)
+                if self.fingertip_closest_points_o is not None else None,
+            ),
+            (
+                "fingertip_surface_normals_slice",
+                self.fingertip_surface_normals_o.flatten(start_dim=1)
+                if self.fingertip_surface_normals_o is not None else None,
+            ),
+        ):
+            setattr(self, slice_name, None)
+            if feature is not None:
+                feature_end = next_feature_start + feature.shape[-1]
+                setattr(self, slice_name, slice(next_feature_start, feature_end))
+                self._optional_state_features.append(feature)
+                next_feature_start = feature_end
+        self.feature_dim = next_feature_start
 
         self.state_frames = self._build_state_frames()
         self.window_index = self._build_window_index()
@@ -378,8 +418,7 @@ class MotionLoader(Dataset):
             object_lin_vel_w,
             object_ang_vel_w,
         ]
-        if self.contact_label is not None:
-            state.append(self.contact_label)
+        state.extend(self._optional_state_features)
         return torch.cat(state, dim=-1)
 
     def _build_motion_slices(self, raw_list: list[Any]) -> tuple[list[slice], list[int]]:
@@ -423,6 +462,8 @@ class MotionLoader(Dataset):
                 self.stride,
                 self.make_relative_enabled,
                 self.use_contact_label,
+                self.use_closest_points,
+                self.use_surface_normals,
             )
             cache_root = self.npz_paths[0].parent if len(self.npz_paths) == 1 else DEFAULT_DATA_PATH
             cache_stem = self.npz_paths[0].stem if len(self.npz_paths) == 1 else "multi_dataset"
@@ -572,6 +613,25 @@ class MotionLoader(Dataset):
         )
         if self.contact_label_slice is not None:
             rollout["contact_label"] = chunk[..., self.contact_label_slice]
+        object_rot_w = rot6d_to_matrix(chunk[..., self.object_rot6d_slice])
+        if self.fingertip_closest_points_slice is not None:
+            closest_points_o = chunk[..., self.fingertip_closest_points_slice].reshape(*chunk.shape[:-1], 10, 3)
+            rollout["fingertip_closest_points_o"] = closest_points_o
+            rollout["fingertip_closest_points_w"] = (
+                torch.matmul(object_rot_w.unsqueeze(-3), closest_points_o.unsqueeze(-1)).squeeze(-1)
+                + rollout["object_pos"].unsqueeze(-2)
+            )
+        if self.fingertip_surface_normals_slice is not None:
+            surface_normals_o = chunk[..., self.fingertip_surface_normals_slice].reshape(*chunk.shape[:-1], 10, 3)
+            surface_normals_w = torch.matmul(
+                object_rot_w.unsqueeze(-3),
+                surface_normals_o.unsqueeze(-1),
+            ).squeeze(-1)
+            rollout["fingertip_surface_normals_o"] = surface_normals_o
+            rollout["fingertip_surface_normals_w"] = surface_normals_w / surface_normals_w.norm(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1e-8)
         return rollout
 
 

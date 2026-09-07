@@ -21,6 +21,34 @@ G1_URDF_PATH = REPO_ROOT / "assets" / "unitree_g1" / "g1_29dof_rev_1_0_with_insp
 DEFAULT_NUM_COLLISION_QUERY_POINTS = 1024
 MIN_POINTS_PER_COLLISION = 8
 
+# Fixed tip-link origins from the checked-in G1 URDF.  The tip links themselves
+# are visual-only fixed children, so their centers are reconstructed from the
+# parent FK body poses rather than included in collision surface sampling.
+FINGERTIP_NAMES = (
+    "left_thumb",
+    "left_index",
+    "left_middle",
+    "left_ring",
+    "left_pinky",
+    "right_thumb",
+    "right_index",
+    "right_middle",
+    "right_ring",
+    "right_pinky",
+)
+FINGERTIP_QUERY_SPEC = (
+    ("L_thumb_distal", (0.0159104, -0.0156076, -0.00599021)),
+    ("L_index_intermediate", (-0.00412053, -0.0433132, -0.00501047)),
+    ("L_middle_intermediate", (-0.00426879, -0.0466043, -0.00498678)),
+    ("L_ring_intermediate", (-0.00366554, -0.0433541, -0.00501047)),
+    ("L_pinky_intermediate", (-0.00260734, -0.0362776, -0.00501047)),
+    ("R_thumb_distal", (0.0159104, 0.0156076, -0.00599021)),
+    ("R_index_intermediate", (-0.00412053, 0.0433132, -0.00501047)),
+    ("R_middle_intermediate", (-0.00426879, 0.0466043, -0.00498678)),
+    ("R_ring_intermediate", (-0.00366554, 0.0433541, -0.00501047)),
+    ("R_pinky_intermediate", (-0.00260734, 0.0362776, -0.00501047)),
+)
+
 
 @wp.kernel
 def _query_object_mesh_kernel(
@@ -268,6 +296,21 @@ def get_query_point(
     return _query_body_local_to_world(body_pos_w, body_quat_w, _collision_query_spec(num_points))
 
 
+def get_fingertip_query_points(chunk: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Return the fixed left/right fingertip centers in ``FINGERTIP_NAMES`` order.
+
+    The returned tensor has shape ``(T, 10, 3)``.  This landmark query is
+    independent of the random full-body collision surface samples.
+    """
+    required = ("body_pos_w", "body_quat_w")
+    missing = [name for name in required if name not in chunk]
+    if missing:
+        raise KeyError(f"Fingertip query requires {missing}")
+    body_pos_w = chunk["body_pos_w"].to(dtype=torch.float32)
+    body_quat_w = chunk["body_quat_w"].to(dtype=torch.float32)
+    return _query_body_local_to_world(body_pos_w, body_quat_w, FINGERTIP_QUERY_SPEC)
+
+
 def get_query_body_indices(
         *,
         num_points: int = DEFAULT_NUM_COLLISION_QUERY_POINTS,
@@ -293,26 +336,21 @@ def _load_object_mesh_template(
     mesh = trimesh.load_mesh(mesh_path, process=False)
     return np.asarray(mesh.vertices, dtype=np.float32), np.asarray(mesh.faces, dtype=np.int32)
 
-def query_object_geometry(
+def _query_object_points_geometry(
         chunk: dict[str, torch.Tensor],
         object_name: str,
+        query_points_w: torch.Tensor,
         *,
-        num_query_points: int = DEFAULT_NUM_COLLISION_QUERY_POINTS,
         max_dist: float = 1.0e6,
         winding_accuracy: float = 2.0,
         winding_threshold: float = 0.5,
     ) -> dict[str, torch.Tensor]:
-    """Query the object mesh from G1 collision-surface points.
+    """Query the object mesh from arbitrary world-space body query points.
 
     ``surface_normal_w`` follows the object mesh triangle winding and should be
     interpreted as the object's outward normal when the mesh is consistently
     oriented.  Every returned tensor is indexed by ``(frame, query_point)``.
     """
-    query_points_w = get_query_point(
-        chunk,
-        num_points=num_query_points,
-    )  # (T, K, 3)
-
     template_vertices, template_faces = _load_object_mesh_template(object_name)
     query_points_local = _query_world_to_object_local(chunk, query_points_w)
 
@@ -418,12 +456,60 @@ def query_object_geometry(
 
     return {
         "query_points_w": query_points_w,
-        "query_body_indices": get_query_body_indices(
-            num_points=num_query_points,
-            device=query_points_w.device,
-        ),
         "signed_distance": signed_distance,
         "closest_points_w": closest_points_w,
         "surface_normals_w": surface_normals_w,
         "valid": query_valid,
     }
+
+
+def query_object_geometry(
+        chunk: dict[str, torch.Tensor],
+        object_name: str,
+        *,
+        num_query_points: int = DEFAULT_NUM_COLLISION_QUERY_POINTS,
+        max_dist: float = 1.0e6,
+        winding_accuracy: float = 2.0,
+        winding_threshold: float = 0.5,
+    ) -> dict[str, torch.Tensor]:
+    """Query the object mesh from the full G1 collision-surface point set."""
+    query_points_w = get_query_point(chunk, num_points=num_query_points)
+    geometry = _query_object_points_geometry(
+        chunk,
+        object_name,
+        query_points_w,
+        max_dist=max_dist,
+        winding_accuracy=winding_accuracy,
+        winding_threshold=winding_threshold,
+    )
+    geometry["query_body_indices"] = get_query_body_indices(
+        num_points=num_query_points,
+        device=query_points_w.device,
+    )
+    return geometry
+
+
+def query_fingertip_object_geometry(
+        chunk: dict[str, torch.Tensor],
+        object_name: str,
+        *,
+        max_dist: float = 1.0e6,
+        winding_accuracy: float = 2.0,
+        winding_threshold: float = 0.5,
+    ) -> dict[str, torch.Tensor]:
+    """Query object geometry at the ten fixed fingertip centers.
+
+    Every returned tensor is indexed by ``(frame, fingertip)`` using the order
+    in ``FINGERTIP_NAMES``.  The query-point dimension is always 10.
+    """
+    fingertip_points_w = get_fingertip_query_points(chunk)
+    geometry = _query_object_points_geometry(
+        chunk,
+        object_name,
+        fingertip_points_w,
+        max_dist=max_dist,
+        winding_accuracy=winding_accuracy,
+        winding_threshold=winding_threshold,
+    )
+    geometry["fingertip_points_w"] = fingertip_points_w
+    return geometry
