@@ -27,7 +27,7 @@ REQUIRED_KEYS = (
 
 
 class HandGeometryDataset(Dataset[dict[str, torch.Tensor]]):
-    """Flatten valid ``(frame, query_point)`` pairs from motion-level splits."""
+    """Return all fixed hand query points for one motion frame at a time."""
 
     def __init__(self, sources: list[dict[str, np.ndarray]], frame_refs: np.ndarray) -> None:
         self.sources = sources
@@ -35,17 +35,16 @@ class HandGeometryDataset(Dataset[dict[str, torch.Tensor]]):
         self.points_per_frame = sources[0]["hand_inner_points_o"].shape[1]
 
     def __len__(self) -> int:
-        return len(self.frame_refs) * self.points_per_frame
+        return len(self.frame_refs)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        frame_row, point_index = divmod(index, self.points_per_frame)
-        source_index, frame_index = self.frame_refs[frame_row]
+        source_index, frame_index = self.frame_refs[index]
         source = self.sources[int(source_index)]
         return {
-            "points_o": torch.from_numpy(source["hand_inner_points_o"][frame_index, point_index]).float(),
-            "sdf": torch.tensor(source["hand_inner_signed_distance"][frame_index, point_index], dtype=torch.float32),
-            "occupancy": torch.tensor(source["hand_inner_occupancy"][frame_index, point_index], dtype=torch.float32),
-            "normal_o": torch.from_numpy(source["hand_inner_surface_normals_o"][frame_index, point_index]).float(),
+            "points_o": torch.from_numpy(source["hand_inner_points_o"][frame_index]).float(),
+            "sdf": torch.from_numpy(source["hand_inner_signed_distance"][frame_index]).float(),
+            "occupancy": torch.from_numpy(source["hand_inner_occupancy"][frame_index]).float(),
+            "normal_o": torch.from_numpy(source["hand_inner_surface_normals_o"][frame_index]).float(),
         }
 
 
@@ -113,7 +112,12 @@ def run_epoch(model: GeometryFieldEncoder, loader: DataLoader, optimizer: torch.
     sums = {name: 0.0 for name in ("total", "tsdf", "occupancy", "normal")}
     count = 0
     for batch in tqdm(loader, leave=False, desc="train" if training else "val"):
-        batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+        batch = {
+            "points_o": batch["points_o"].reshape(-1, 3).to(device, non_blocking=True),
+            "sdf": batch["sdf"].reshape(-1).to(device, non_blocking=True),
+            "occupancy": batch["occupancy"].reshape(-1).to(device, non_blocking=True),
+            "normal_o": batch["normal_o"].reshape(-1, 3).to(device, non_blocking=True),
+        }
         with torch.set_grad_enabled(training):
             losses = loss_terms(model, batch, args)
             if training:
@@ -183,16 +187,21 @@ def build_dataloaders(
     sources, train_frames, val_frames = load_data(paths, args.val_fraction, args.seed)
     train_set = HandGeometryDataset(sources, train_frames)
     val_set = HandGeometryDataset(sources, val_frames)
+    points_per_frame = train_set.points_per_frame
+    if args.batch_size < points_per_frame:
+        raise ValueError(
+            f"--batch-size must be at least points_per_frame={points_per_frame}, got {args.batch_size}"
+        )
     loader_args = {
-        "batch_size": args.batch_size,
+        "batch_size": args.batch_size // points_per_frame,
         "num_workers": args.num_workers,
         "pin_memory": device.type == "cuda",
     }
     return (
         DataLoader(train_set, shuffle=True, **loader_args),
         DataLoader(val_set, shuffle=False, **loader_args),
-        len(train_set),
-        len(val_set),
+        len(train_set) * points_per_frame,
+        len(val_set) * points_per_frame,
     )
 
 
