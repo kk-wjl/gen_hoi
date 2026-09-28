@@ -513,3 +513,40 @@ def query_fingertip_object_geometry(
     )
     geometry["fingertip_points_w"] = fingertip_points_w
     return geometry
+
+
+def query_hand_inner_object_geometry(
+        chunk: dict[str, torch.Tensor],
+        object_name: str,
+        *,
+        points_per_hand: int = 64,
+        max_dist: float = 1.0e6,
+        winding_accuracy: float = 2.0,
+        winding_threshold: float = 0.5,
+    ) -> dict[str, torch.Tensor]:
+    """Query object geometry at fixed palm-facing hand surface points.
+
+    The returned point dimension is ``2 * points_per_hand`` in the stable
+    left-then-right order defined by :mod:`geometry.hand_queries`.
+    """
+    # Import locally so metric-only workflows do not initialize the hand-query
+    # module unless this denser contact representation is requested.
+    from geometry.hand_queries import (
+        get_hand_inner_query_body_indices,
+        get_hand_inner_query_points,
+    )
+
+    hand_points_w = get_hand_inner_query_points(chunk, points_per_hand=points_per_hand)
+    geometry = _query_object_points_geometry(
+        chunk,
+        object_name,
+        hand_points_w,
+        max_dist=max_dist,
+        winding_accuracy=winding_accuracy,
+        winding_threshold=winding_threshold,
+    )
+    geometry["hand_inner_points_w"] = hand_points_w
+    geometry["query_body_indices"] = get_hand_inner_query_body_indices(
+        points_per_hand=points_per_hand,
+    ).to(device=hand_points_w.device)
+    return geometry
